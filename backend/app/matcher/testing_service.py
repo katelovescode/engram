@@ -18,7 +18,7 @@ from loguru import logger
 from app import __version__
 from app.matcher.addic7ed_client import Addic7edClient
 from app.matcher.asr_provider import get_asr_provider
-from app.matcher.os_api_retry import os_api_call
+from app.matcher.os_api_retry import _RETRYABLE_EXCEPTIONS, os_api_call
 from app.matcher.provider_scheduler import EpisodeJob, run_jobs
 from app.matcher.srt_utils import extract_audio_chunk, get_video_duration
 from app.matcher.subtitle_provider import LocalSubtitleProvider
@@ -154,7 +154,7 @@ def _get_os_client(config) -> object | None:
         # would propagate that AttributeError to the caller unhandled.
         try:
             client = _OSApi(_USER_AGENT, config.opensubtitles_api_key)
-            login_response = os_api_call(
+            os_api_call(
                 client.login,
                 config.opensubtitles_username,
                 config.opensubtitles_password,
@@ -168,16 +168,44 @@ def _get_os_client(config) -> object | None:
             _OS.failed = True
             return None
 
+        # The login response only carries ``allowed_downloads`` — the daily
+        # CAP (e.g. 1000 for VIP), NOT how many remain. Trusting it makes the
+        # build believe quota is full when it may already be exhausted, then
+        # 406 ("quota exceeded") on every per-season download while logging a
+        # reassuring "1000 remaining". One ``/infos/user`` call up front (it
+        # does NOT consume download quota) yields the true ``remaining_downloads``
+        # and, as a side effect, updates ``client.user_downloads_remaining``.
         try:
-            remaining = login_response["user"]["allowed_downloads"]
+            os_api_call(client.user_info)
+        except _RETRYABLE_EXCEPTIONS as e:
+            # Non-fatal: if the probe itself fails we proceed with whatever
+            # the library seeded (the cap) rather than blocking the run.
+            logger.debug(f"OS user-info probe failed (non-fatal): {e}", exc_info=True)
+        remaining = getattr(client, "user_downloads_remaining", None)
+
+        if remaining is not None and remaining <= 0:
+            # Quota is spent for today. Skip OpenSubtitles for the rest of the
+            # run instead of paying a search + 406 + retry on every season —
+            # the daily bucket won't refill for hours. Falls straight through
+            # to the scrapers (Addic7ed / TVsubtitles).
+            logger.warning(
+                f"OpenSubtitles API: daily download quota exhausted "
+                f"({remaining} remaining) — skipping OpenSubtitles for this run; "
+                "falling back to scrapers (Addic7ed/TVsubtitles)"
+            )
+            _OS.failed = True
+            _snapshot_os_quota(client)
+            return None
+
+        if remaining is not None:
             logger.info(f"OpenSubtitles API login OK — {remaining} downloads remaining today")
-        except (KeyError, TypeError):
+        else:
             logger.info("OpenSubtitles API login OK")
         _OS.client = client
         _OS.login_time = time.monotonic()
-        # Seed the quota snapshot from the login response — gives the build
-        # script's final summary a starting baseline even if no downloads
-        # happen this run (e.g., the whole cache is already populated).
+        # Seed the quota snapshot from the (now accurate) client attribute —
+        # gives the build script's final summary a starting baseline even if
+        # no downloads happen this run (e.g., the whole cache is already populated).
         _snapshot_os_quota(client)
         return client
 
