@@ -408,3 +408,173 @@ class TestExecutableValidationHardening:
         assert result.valid is False
         assert "FFmpeg executable" in result.error
         mock_run.assert_not_called()
+
+    def test_probe_version_refuses_non_makemkv_path(self):
+        """The version probe self-guards: a non-MakeMKV basename never reaches subprocess."""
+        from app.api.validation import _probe_makemkv_version
+
+        with patch("app.api.validation.subprocess.run") as mock_run:
+            version = _probe_makemkv_version("/bin/sh")
+
+        assert version == "MakeMKV (version not detectable)"
+        mock_run.assert_not_called()
+
+    def test_validate_binary_refuses_non_makemkv_path(self):
+        """The binary validator self-guards: a non-MakeMKV basename never reaches subprocess."""
+        from app.api.validation import _validate_makemkv_binary
+
+        with patch("app.api.validation.subprocess.run") as mock_run:
+            result = _validate_makemkv_binary("/usr/bin/python3")
+
+        assert result.found is False
+        mock_run.assert_not_called()
+
+    def test_probe_timeout_returns_distinct_string(self):
+        """A probe timeout is surfaced distinctly, not masked as 'not detectable'."""
+        import subprocess
+
+        from app.api.validation import _probe_makemkv_version
+
+        with patch(
+            "app.api.validation.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="makemkvcon64", timeout=20),
+        ):
+            version = _probe_makemkv_version("C:/MakeMKV/makemkvcon64.exe")
+
+        assert version == "MakeMKV (version probe timed out)"
+
+    def test_validate_binary_surfaces_probe_timeout(self):
+        """A found binary whose probe times out reports found=True with the timeout string."""
+        import subprocess
+
+        from app.api.validation import _validate_makemkv_binary
+
+        def fake_run(cmd, **kwargs):
+            if "-r" in cmd:  # the version probe
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=20)
+            mock = MagicMock()  # the no-arg validity check
+            mock.stdout = "Use: makemkvcon [switches] Command [Parameters]\n"
+            mock.stderr = ""
+            mock.returncode = 1
+            return mock
+
+        with patch("app.api.validation.subprocess.run", side_effect=fake_run):
+            result = _validate_makemkv_binary("C:/MakeMKV/makemkvcon64.exe")
+
+        assert result.found is True
+        assert result.version == "MakeMKV (version probe timed out)"
+
+
+class TestMakeMKVVersionExtraction:
+    """Parse MakeMKV version from real makemkvcon output.
+
+    Regression: makemkvcon with no arguments only prints usage text (no version),
+    so version detection must read the robot-mode (-r) MSG:1005 startup banner.
+    """
+
+    # Verbatim robot-mode startup line captured from makemkvcon64.exe v1.18.3.
+    ROBOT_BANNER = (
+        'MSG:1005,0,1,"MakeMKV v1.18.3 win(x64-release) started",'
+        '"%1 started","MakeMKV v1.18.3 win(x64-release)"\n'
+        'DRV:0,1,999,0,"BD-RE PIONEER BD-RW   BDR-S13U 1.03","","F:"\n'
+    )
+
+    # No-arg invocation output — usage text with no version anywhere.
+    HELP_TEXT = (
+        "Use: makemkvcon [switches] Command [Parameters]\n"
+        "\n"
+        "Commands:\n"
+        "  info <source>\n"
+        "      prints info about disc\n"
+        "  reg <key string or file name>\n"
+        "      enter registration key into program\n"
+    )
+
+    def test_extracts_version_from_robot_banner(self):
+        """The robot banner yields a clean product+version+platform string."""
+        from app.api.validation import _extract_makemkv_version
+
+        assert _extract_makemkv_version(self.ROBOT_BANNER) == "MakeMKV v1.18.3 win(x64-release)"
+
+    def test_extracts_linux_banner(self):
+        """Platform tag varies by OS — the Linux banner parses too."""
+        from app.api.validation import _extract_makemkv_version
+
+        output = 'MSG:1005,0,1,"MakeMKV v1.17.7 linux(x64-release) started","%1 started",""\n'
+        assert _extract_makemkv_version(output) == "MakeMKV v1.17.7 linux(x64-release)"
+
+    def test_help_text_falls_back(self):
+        """Usage text has no version, so the fallback string is returned."""
+        from app.api.validation import _extract_makemkv_version
+
+        assert _extract_makemkv_version(self.HELP_TEXT) == "MakeMKV (version not detectable)"
+
+    def test_spurious_v1_lines_do_not_match(self):
+        """Verbose robot output without a banner must not return a spurious 'v1.' line."""
+        from app.api.validation import _extract_makemkv_version
+
+        noisy = (
+            'DRV:0,1,999,1,"BD-RE PIONEER BD-RW   BDR-S13U 1.03","","F:"\n'
+            'MSG:5010,0,0,"v1.0 codec loaded","%1 loaded","v1.0"\n'
+            'MSG:3007,0,0,"using direct disc access","",""\n'
+        )
+        assert _extract_makemkv_version(noisy) == "MakeMKV (version not detectable)"
+
+    def test_banner_wins_over_noise(self):
+        """The real banner is extracted even when spurious 'v1.' lines precede it."""
+        from app.api.validation import _extract_makemkv_version
+
+        output = 'MSG:5010,0,0,"v1.0 codec loaded","%1 loaded","v1.0"\n' + self.ROBOT_BANNER
+        assert _extract_makemkv_version(output) == "MakeMKV v1.18.3 win(x64-release)"
+
+    def test_validate_binary_probes_robot_mode_for_version(self):
+        """End-to-end: validity comes from the no-arg call, version from the -r probe."""
+        from app.api.validation import _validate_makemkv_binary
+
+        def fake_run(cmd, **kwargs):
+            mock = MagicMock()
+            mock.stdout = self.ROBOT_BANNER if "-r" in cmd else self.HELP_TEXT
+            mock.stderr = ""
+            mock.returncode = 1
+            return mock
+
+        with patch("app.api.validation.subprocess.run", side_effect=fake_run):
+            result = _validate_makemkv_binary("C:/MakeMKV/makemkvcon64.exe")
+
+        assert result.found is True
+        assert result.version == "MakeMKV v1.18.3 win(x64-release)"
+
+
+class TestDetectionOffloadsBlockingWork:
+    """Tool detection shells out (blocking), so it must not run on the event loop."""
+
+    def test_detect_tools_runs_detection_off_event_loop(self):
+        """detect_tools offloads blocking detection to a worker thread."""
+        import asyncio
+        import threading
+
+        from app.api import validation
+        from app.api.validation import ToolDetectionResult, detect_tools
+
+        loop_thread = threading.get_ident()
+        observed: dict[str, int] = {}
+
+        def fake_makemkv() -> ToolDetectionResult:
+            observed["makemkv"] = threading.get_ident()
+            return ToolDetectionResult(found=True, path="m", version="MakeMKV v1.18.3")
+
+        def fake_ffmpeg() -> ToolDetectionResult:
+            observed["ffmpeg"] = threading.get_ident()
+            return ToolDetectionResult(found=True, path="f", version="ffmpeg 6.0")
+
+        with (
+            patch.object(validation, "detect_makemkv", fake_makemkv),
+            patch.object(validation, "detect_ffmpeg", fake_ffmpeg),
+        ):
+            result = asyncio.run(detect_tools())
+
+        assert result.makemkv.version == "MakeMKV v1.18.3"
+        assert result.ffmpeg.version == "ffmpeg 6.0"
+        # Both detections ran on worker threads, never the event loop thread.
+        assert observed["makemkv"] != loop_thread
+        assert observed["ffmpeg"] != loop_thread
