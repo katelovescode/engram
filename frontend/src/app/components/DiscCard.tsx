@@ -67,6 +67,7 @@ export interface DiscData {
   currentSpeed?: string;
   etaSeconds?: number;
   subtitleStatus?: string;
+  subtitleError?: string;
   startedAt?: string;
   needsReview?: boolean;
   conflictStatus?: string;
@@ -320,14 +321,6 @@ const DiscCardComponent = React.forwardRef<HTMLDivElement, DiscCardProps>(
                       {failedTrackCount} FAILED
                     </span>
                   )}
-                  {disc.subtitleStatus === 'failed' && (
-                    <span
-                      title="Subtitle download failed"
-                      style={{ fontSize: 16, color: sv.yellow }}
-                    >
-                      ⚠
-                    </span>
-                  )}
                   {elapsed && (
                     <div
                       title="Elapsed time"
@@ -355,6 +348,35 @@ const DiscCardComponent = React.forwardRef<HTMLDivElement, DiscCardProps>(
                   />
                 </div>
               </div>
+
+              {/* No reference subtitles — loud + actionable while the job is still
+                  actionable. Hidden once completed (e.g. user assigned manually). */}
+              {disc.subtitleStatus === 'failed' && disc.state !== 'completed' && (
+                <div
+                  role="alert"
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 8,
+                    marginBottom: 16,
+                    padding: "10px 12px",
+                    border: `1px solid ${sv.red}`,
+                    borderLeft: `3px solid ${sv.red}`,
+                    background: "rgba(255, 77, 79, 0.08)",
+                    fontFamily: sv.mono,
+                    fontSize: 12,
+                    lineHeight: 1.45,
+                    letterSpacing: "0.02em",
+                    color: sv.red,
+                  }}
+                >
+                  <span aria-hidden style={{ flexShrink: 0 }}>⚠</span>
+                  <span>
+                    {disc.subtitleError ||
+                      "No subtitles found — episode matching can't run. Open to assign episodes manually."}
+                  </span>
+                </div>
+              )}
 
               {/* Scanning / identifying — full disc-insert visualization */}
               {disc.state === "scanning" && (() => {
