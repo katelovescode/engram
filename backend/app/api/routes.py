@@ -24,7 +24,7 @@ from sqlmodel import select
 
 from app.config import settings
 from app.core.discdb_exporter import get_makemkv_log_dir
-from app.core.security import is_allowed_image_url
+from app.core.security import is_allowed_image_url, sanitize_log_value
 from app.database import get_session
 from app.matcher.coverage_tracker import get_cache_status
 from app.matcher.tmdb_client import fetch_season_episodes
@@ -1927,6 +1927,7 @@ class ReassignRequest(BaseModel):
 
     episode_code: str
     edition: str | None = None
+    source: str = "user"
 
 
 class ReleaseGroupRequest(BaseModel):
@@ -2324,11 +2325,106 @@ async def reassign_episode(
     from app.services.job_manager import job_manager
 
     try:
-        await job_manager.reassign_episode(job.id, title_id, request.episode_code, request.edition)
+        await job_manager.reassign_episode(
+            job.id, title_id, request.episode_code, request.edition, source=request.source
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
 
     return {"status": "reassigned", "title_id": title_id}
+
+
+async def _run_llm_match_for_title(*, title: "DiscTitle", job: "DiscJob") -> dict | None:
+    """Invoke the LLM episode matcher for a single title. Returns suggestion dict or None."""
+    from app.core.curator import episode_curator
+    from app.matcher.llm_episode_matcher import match_episode_via_llm
+    from app.matcher.tmdb_client import fetch_show_id
+    from app.services.config_service import get_config
+
+    config = await get_config()
+    if not config or not getattr(config, "ai_episode_matching_enabled", False):
+        return None
+    if not config.ai_api_key or not job.detected_title or not job.detected_season:
+        return None
+
+    # Make sure the matcher is initialized for the show (so transcribe_full works)
+    episode_curator._ensure_initialized(job.detected_title)
+    if not episode_curator._matcher:
+        return None
+
+    tmdb_show_id = await asyncio.to_thread(fetch_show_id, job.detected_title)
+    if not tmdb_show_id:
+        return None
+
+    transcript = await asyncio.to_thread(
+        episode_curator._matcher.transcribe_full, Path(title.file_path)
+    )
+    if not transcript:
+        return None
+
+    suggestion = await match_episode_via_llm(
+        transcript=transcript,
+        show_name=job.detected_title,
+        season=job.detected_season,
+        tmdb_show_id=str(tmdb_show_id),
+        ai_provider=config.ai_provider,
+        ai_api_key=config.ai_api_key,
+        tmdb_api_key=config.tmdb_api_key,
+    )
+    if not suggestion:
+        return None
+    return {
+        "episode": suggestion.episode,
+        "confidence": suggestion.confidence,
+        "reasoning": suggestion.reasoning,
+        "runner_up": (
+            {"episode": suggestion.runner_up.episode, "confidence": suggestion.runner_up.confidence}
+            if suggestion.runner_up is not None
+            else None
+        ),
+        "model": suggestion.model,
+    }
+
+
+@router.post("/jobs/{job_id}/titles/{title_id}/llm-match")
+async def llm_match_title(
+    title_id: int,
+    job: DiscJob = Depends(get_job_or_404),
+    session: AsyncSession = Depends(get_session),
+):
+    """Run the LLM episode matcher on a single title and persist the suggestion.
+
+    Idempotent under double-clicks: if `match_details.llm_suggestion` is
+    already populated, returns it immediately (`reason: "cached"`) without
+    kicking off another 1–3 minute Whisper transcription. Re-running
+    intentionally is out of scope for v1.
+    """
+    title = await session.get(DiscTitle, title_id)
+    if not title or title.job_id != job.id:
+        raise HTTPException(status_code=404, detail="Title not found")
+
+    # Cache-hit dedup: avoid duplicate expensive transcription on double-click.
+    existing = json.loads(title.match_details or "{}") if title.match_details else {}
+    cached = existing.get("llm_suggestion")
+    if cached:
+        return {"suggestion": cached, "reason": "cached"}
+
+    try:
+        suggestion = await _run_llm_match_for_title(title=title, job=job)
+    except Exception:
+        logger.exception("LLM match endpoint failed for title %s", sanitize_log_value(title_id))
+        return {"suggestion": None, "reason": "internal_error"}
+
+    if not suggestion:
+        return {"suggestion": None, "reason": "no_suggestion"}
+
+    # Persist into match_details for refresh durability
+    existing["llm_suggestion"] = suggestion
+    title.match_details = json.dumps(existing)
+    session.add(title)
+    await session.commit()
+
+    return {"suggestion": suggestion, "reason": None}
 
 
 @router.post("/contributions/{job_id}/submit")
