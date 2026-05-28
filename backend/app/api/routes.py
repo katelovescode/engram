@@ -295,6 +295,8 @@ class ConfigResponse(BaseModel):
     # Chromaprint fingerprinting (Phase 1)
     fpcalc_path: str
     enable_fingerprint_contributions: bool
+    # Chromaprint Phase 2
+    fingerprint_server_url: str | None = None
 
 
 class ConfigUpdate(BaseModel):
@@ -365,6 +367,8 @@ class ConfigUpdate(BaseModel):
     # Chromaprint fingerprinting (Phase 1)
     fpcalc_path: str | None = None
     enable_fingerprint_contributions: bool | None = None
+    # Chromaprint Phase 2
+    fingerprint_server_url: str | None = None
 
 
 class ReviewRequest(BaseModel):
@@ -1045,6 +1049,8 @@ async def get_config() -> ConfigResponse:
         # Chromaprint fingerprinting (Phase 1)
         fpcalc_path=config.fpcalc_path or "",
         enable_fingerprint_contributions=config.enable_fingerprint_contributions,
+        # Chromaprint Phase 2
+        fingerprint_server_url=config.fingerprint_server_url,
     )
 
 
@@ -1092,11 +1098,21 @@ async def update_config(config: ConfigUpdate) -> dict:
     from app.services.config_service import update_config as update_db_config
 
     # Build kwargs from non-None fields
-    # Allow None through for import_watch_path so users can clear the field
-    _nullable_fields = {"import_watch_path"}
+    # Allow None through for fields that can be cleared to null
+    _nullable_fields = {"import_watch_path", "fingerprint_server_url"}
     update_data = {
         k: v for k, v in config.model_dump().items() if v is not None or k in _nullable_fields
     }
+
+    # Validate fingerprint_server_url against SSRF before persisting
+    if update_data.get("fingerprint_server_url"):
+        from app.core.security import is_safe_remote_url
+
+        if not is_safe_remote_url(update_data["fingerprint_server_url"]):
+            raise HTTPException(
+                status_code=422,
+                detail="fingerprint_server_url must be an http/https URL pointing to a non-internal host",
+            )
 
     # Validate naming format strings before persisting
     from app.core.organizer import (
@@ -1290,6 +1306,79 @@ async def list_fingerprint_contributions(
         for r in rows
     ]
     return {"count": len(items), "items": items}
+
+
+@router.delete("/fingerprint/contributions/{contrib_id}", dependencies=[Depends(require_localhost)])
+async def forget_fingerprint_contribution(
+    contrib_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Delete a locally-queued fingerprint contribution (forget).
+
+    Returns 400 if the contribution was already uploaded — the data already
+    exists on the server and cannot be recalled from here.
+    """
+    from app.models.fingerprint import FingerprintContribution
+
+    contrib = await session.get(FingerprintContribution, contrib_id)
+    if contrib is None:
+        raise HTTPException(status_code=404, detail="Contribution not found")
+    if contrib.upload_status == "success":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete an already-uploaded contribution; the data is already on the server.",
+        )
+    if contrib.upload_status is None and contrib.upload_attempts > 0:
+        # upload_attempts > 0 means the background uploader has already tried
+        # this row at least once and may be holding it in an active HTTP call.
+        # Deleting now would cause a silent no-op UPDATE on a ghost row.
+        raise HTTPException(
+            status_code=409,
+            detail="Contribution may be in-flight (upload already attempted). Try again after the next poll cycle or wait for it to succeed or fail.",
+        )
+    await session.delete(contrib)
+    await session.commit()
+    return {"status": "deleted", "contrib_id": contrib_id}
+
+
+@router.post(
+    "/fingerprint/contributions/rotate-pseudonym", dependencies=[Depends(require_localhost)]
+)
+async def rotate_contribution_pseudonym(
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Generate a fresh pseudonym and re-tag all pending contributions.
+
+    Already-uploaded rows retain their old pseudonym (server already has them
+    under that identity). Pending rows get the new pseudonym so future uploads
+    are unlinkable to past ones.
+    """
+    from app.models.fingerprint import FingerprintContribution
+    from app.services.config_service import update_config as update_db_config
+    from app.services.contribution_pseudonym import generate_pseudonym
+
+    new_pseudonym = generate_pseudonym()
+
+    # update_db_config auto-creates the app_config row when absent, so the
+    # pseudonym is always persisted even on a fresh database.
+    await update_db_config(contribution_pseudonym=new_pseudonym)
+
+    pending = (
+        (
+            await session.execute(
+                select(FingerprintContribution).where(
+                    FingerprintContribution.upload_status.is_(None)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in pending:
+        row.pseudonym = new_pseudonym
+
+    await session.commit()
+    return {"pseudonym": new_pseudonym, "pending_retagged": len(pending)}
 
 
 # --- Simulation Endpoints (debug mode only) ---
