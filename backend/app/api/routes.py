@@ -17,7 +17,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -381,6 +381,20 @@ class ReviewRequest(BaseModel):
     title_id: int
     episode_code: str | None = None  # e.g., "S01E01"
     edition: str | None = None  # e.g., "Extended", "Theatrical"
+
+
+class ReviewDecision(BaseModel):
+    """A single title's review decision within a batch."""
+
+    title_id: int
+    episode_code: str | None = None  # e.g., "S01E01", "extra", "skip"
+    edition: str | None = None  # e.g., "Extended", "Theatrical"
+
+
+class ReviewBatchRequest(BaseModel):
+    """Request model for submitting multiple review decisions at once."""
+
+    decisions: list[ReviewDecision] = Field(..., min_length=1)
 
 
 def _history_job_dict(j: DiscJob) -> dict:
@@ -805,10 +819,39 @@ async def submit_review(
 
     from app.services.job_manager import job_manager
 
-    await job_manager.apply_review(
-        job.id, review.title_id, episode_code=review.episode_code, edition=review.edition
-    )
+    try:
+        await job_manager.apply_review(
+            job.id, review.title_id, episode_code=review.episode_code, edition=review.edition
+        )
+    except ValueError as e:
+        # e.g. an unknown title_id — a client error, not a server fault.
+        raise HTTPException(status_code=422, detail=str(e)) from e
     return {"status": "reviewed", "job_id": job.id}
+
+
+@router.post("/jobs/{job_id}/review/batch")
+async def submit_review_batch(
+    review: ReviewBatchRequest,
+    job: DiscJob = Depends(get_job_or_404),
+) -> dict:
+    """Submit several review decisions for a job in one atomic request.
+
+    Backs the review-tab multiselect bulk actions (mark many titles as extra,
+    discard, etc.). Decisions are applied together and the job is finalized once,
+    avoiding the FILE_EXISTS collisions that repeated single-title saves can hit.
+    """
+    if job.state != JobState.REVIEW_NEEDED:
+        raise HTTPException(status_code=400, detail="Job is not awaiting review")
+
+    from app.services.job_manager import job_manager
+
+    decisions = [d.model_dump() for d in review.decisions]
+    try:
+        await job_manager.apply_review_batch(job.id, decisions)
+    except ValueError as e:
+        # e.g. an unknown title_id in one of the decisions — a client error.
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"status": "reviewed", "job_id": job.id, "count": len(decisions)}
 
 
 class SetNameRequest(BaseModel):
