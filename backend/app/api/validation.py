@@ -249,16 +249,53 @@ FPCALC_COMMON_PATHS = [
 _DEV_FPCALC_ENV = "ENGRAM_FPCALC_PATH"
 
 
+def _bundled_fpcalc_path() -> str | None:
+    """Return the path to the fpcalc binary shipped with Engram, if present.
+
+    Frozen PyInstaller builds carry it at ``<sys._MEIPASS>/bin/fpcalc[.exe]``;
+    source checkouts get it at ``app/bin/fpcalc[.exe]`` once
+    ``scripts/fetch_fpcalc.py`` has populated that directory. Returns the first
+    existing candidate, or None when no bundled copy is available — so the
+    detector cleanly falls through to PATH / common locations.
+    """
+    name = "fpcalc.exe" if os.name == "nt" else "fpcalc"
+    roots: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        # Frozen build: the spec bundles fpcalc to <_MEIPASS>/bin. (In a frozen
+        # build __file__ also lives under _MEIPASS, so the app/bin probe below
+        # would resolve to a path that never exists — skip it.)
+        roots.append(Path(meipass) / "bin")
+    else:
+        # Source checkout: app/bin/ (app/ is the parent of this module's package
+        # dir, app/api/ -> app/), populated by scripts/fetch_fpcalc.py.
+        roots.append(Path(__file__).resolve().parent.parent / "bin")
+    for root in roots:
+        candidate = root / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def detect_fpcalc() -> ToolDetectionResult:
     """Auto-detect a usable fpcalc binary.
 
-    Order: explicit `ENGRAM_FPCALC_PATH` env var, then PATH, then common
-    platform locations. Returns the first result that validates successfully.
+    Order: explicit ``ENGRAM_FPCALC_PATH`` env var, then Engram's bundled copy
+    (``<_MEIPASS>/bin`` when frozen, ``app/bin`` in a checkout), then PATH, then
+    common platform locations. Returns the first result that validates
+    successfully.
     """
     candidates: list[str] = []
     env_override = os.environ.get(_DEV_FPCALC_ENV)
     if env_override:
         candidates.append(env_override)
+    # Engram's own bundled copy beats whatever is on PATH so users get the
+    # known-good shipped version by default — but an explicit env override still
+    # wins, and a bundled binary that fails validation (e.g. wrong arch) falls
+    # through to PATH / common locations below.
+    bundled = _bundled_fpcalc_path()
+    if bundled:
+        candidates.append(bundled)
     via_path = shutil.which("fpcalc")
     if via_path:
         candidates.append(via_path)
