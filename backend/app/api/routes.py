@@ -1020,8 +1020,6 @@ async def retry_subtitle_download(
     job: DiscJob = Depends(get_job_or_404),
 ) -> dict:
     """Retry subtitle download for a job that failed."""
-    import asyncio
-
     if job.subtitle_status not in ("failed", None):
         raise HTTPException(
             status_code=400,
@@ -1038,7 +1036,9 @@ async def retry_subtitle_download(
     from app.services.job_manager import job_manager
 
     asyncio.create_task(
-        job_manager._download_subtitles(job.id, job.detected_title, job.detected_season)
+        job_manager._download_subtitles(
+            job.id, job.detected_title, job.detected_season, job.tmdb_id
+        )
     )
 
     return {"status": "retry_started", "job_id": job.id}

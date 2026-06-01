@@ -250,7 +250,7 @@ class TestDownloadSubtitlesMessaging:
         monkeypatch.setattr(ws_manager, "broadcast_subtitle_event", _noop)
         monkeypatch.setattr(
             "app.matcher.testing_service.download_subtitles",
-            lambda show, season: {"episodes": episodes, "show_name": show},
+            lambda show, season, tmdb_id=None: {"episodes": episodes, "show_name": show},
         )
 
     async def test_no_subtitles_sets_actionable_show_specific_message(self, monkeypatch):
@@ -439,7 +439,10 @@ class TestDownloadSubtitlesAllSeasons:
         monkeypatch.setattr(ws_manager, "broadcast_subtitle_event", _noop)
         monkeypatch.setattr(
             "app.matcher.testing_service.download_subtitles",
-            lambda show, season: {"episodes": per_season.get(season, []), "show_name": show},
+            lambda show, season, tmdb_id=None: {
+                "episodes": per_season.get(season, []),
+                "show_name": show,
+            },
         )
 
     async def test_completes_when_any_season_has_references(self, monkeypatch):

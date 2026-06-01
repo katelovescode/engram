@@ -41,14 +41,25 @@ class EpisodeCurator:
         self._cache_dir: Path | None = None
         self._current_show: str | None = None
         self._current_show_id: str | None = None
+        self._current_tmdb_id: int | None = None
 
-    def _ensure_initialized(self, show_name: str) -> bool:
-        """Lazily initialize the matcher library for a specific show."""
-        # Re-initialize if show name changed
-        if self._initialized and self._current_show == show_name:
+    def _ensure_initialized(self, show_name: str, tmdb_id: int | None = None) -> bool:
+        """Lazily initialize the matcher library for a specific show.
+
+        When ``tmdb_id`` is known (e.g. after the user disambiguated a same-name
+        collision), it is used directly instead of resolving by name — and it is
+        passed to EpisodeMatcher as the corpus guard's expected id.
+        """
+        # Re-initialize if show name OR known id changed.
+        if (
+            self._initialized
+            and self._current_show == show_name
+            and self._current_tmdb_id == tmdb_id
+        ):
             return self._matcher is not None
 
         self._current_show = show_name
+        self._current_tmdb_id = tmdb_id
 
         try:
             # Import from local matcher package
@@ -58,15 +69,19 @@ class EpisodeCurator:
             # Get cache directory from config (sync version for non-async context)
             from app.services.config_service import get_config_sync
 
-            # Resolve canonical show name
+            # Resolve canonical show name. Use the caller-supplied tmdb_id directly
+            # when known (skips fetch_show_id, which resolves by NAME and can't tell
+            # two same-named shows apart); otherwise resolve by name.
             canonical_name = show_name
             try:
-                # We need to run async TMDB calls in a sync context here or use sync versions?
-                # tmdb_client functions are synchronous (requests based)
-                tmdb_id = fetch_show_id(show_name)
-                self._current_show_id = str(tmdb_id) if tmdb_id else None
-                if tmdb_id:
-                    details = fetch_show_details(tmdb_id)
+                if tmdb_id is not None:
+                    resolved_id = tmdb_id
+                    self._current_show_id = str(tmdb_id)
+                else:
+                    resolved_id = fetch_show_id(show_name)
+                    self._current_show_id = str(resolved_id) if resolved_id else None
+                if resolved_id:
+                    details = fetch_show_details(resolved_id)
                     if details and "name" in details:
                         canonical_name = details["name"]
                         logger.info(
@@ -88,6 +103,7 @@ class EpisodeCurator:
                 cache_dir=self._cache_dir,
                 show_name=canonical_name,
                 min_confidence=self.LOW_CONFIDENCE_THRESHOLD,
+                expected_tmdb_id=tmdb_id,
             )
             self._initialized = True
             logger.info(
@@ -192,6 +208,7 @@ class EpisodeCurator:
         progress_callback: Callable[..., None] | None = None,
         num_points: int | None = None,
         min_vote_count: int | None = None,
+        tmdb_id: int | None = None,
     ) -> MatchResult:
         """Match a file when the season is unknown by searching every candidate season.
 
@@ -215,7 +232,7 @@ class EpisodeCurator:
         best: MatchResult | None = None
         for s in seasons:
             result = await self.match_single_file(
-                file_path, series_name, s, progress_callback, num_points, min_vote_count
+                file_path, series_name, s, progress_callback, num_points, min_vote_count, tmdb_id
             )
             if not result.episode_code:
                 continue
@@ -235,6 +252,7 @@ class EpisodeCurator:
         series_name: str | None = None,
         season: int | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        tmdb_id: int | None = None,
     ) -> list[MatchResult]:
         """Match a list of MKV files to episodes.
 
@@ -257,7 +275,7 @@ class EpisodeCurator:
                 results.append(self._fallback_result(file_path))
             return results
 
-        if not self._ensure_initialized(series_name):
+        if not self._ensure_initialized(series_name, tmdb_id):
             # Return unmatched results if matcher not available
             for i, file_path in enumerate(files):
                 if progress_callback:
@@ -267,7 +285,9 @@ class EpisodeCurator:
 
         for i, file_path in enumerate(files):
             try:
-                result = await self.match_single_file(file_path, series_name, season)
+                result = await self.match_single_file(
+                    file_path, series_name, season, tmdb_id=tmdb_id
+                )
                 results.append(result)
             except Exception as e:
                 logger.error(f"Error matching {file_path}: {e}")
@@ -286,6 +306,7 @@ class EpisodeCurator:
         progress_callback: Callable[..., None] | None = None,
         num_points: int | None = None,
         min_vote_count: int | None = None,
+        tmdb_id: int | None = None,
     ) -> MatchResult:
         """Match a single file to an episode using audio fingerprinting.
 
@@ -302,7 +323,7 @@ class EpisodeCurator:
 
         # Ensure matcher is initialized for this show
         if series_name:
-            initialized = self._ensure_initialized(series_name)
+            initialized = self._ensure_initialized(series_name, tmdb_id)
             logger.info(
                 f"Matcher initialized={initialized}, matcher={'available' if self._matcher else 'None'}"
             )
@@ -315,7 +336,7 @@ class EpisodeCurator:
             # Season unknown (e.g. a flat import folder with no Season NN dir):
             # search across every candidate season and keep the best match.
             return await self._match_across_seasons(
-                file_path, series_name, progress_callback, num_points, min_vote_count
+                file_path, series_name, progress_callback, num_points, min_vote_count, tmdb_id
             )
 
         # Phase 3 cascade: chromaprint first (no-op when the flag is off → identical to legacy ASR path).

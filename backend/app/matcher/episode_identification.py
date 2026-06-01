@@ -61,7 +61,20 @@ def load_precomputed_manifest(cache_dir) -> dict | None:
     return manifest
 
 
-def precomputed_covers_season(cache_dir, show_name: str, season: int, manifest=None) -> bool:
+def _tmdb_id_mismatch(expected, entry_id) -> bool:
+    """True when both ids are known and disagree (string-compared).
+
+    Shared by the corpus guard's two call sites (this module's
+    ``precomputed_covers_season`` and ``EpisodeMatcher._load_precomputed_season``)
+    so the comparison can't silently diverge. Returns False when either id is
+    unknown — backward-compatible with name-only matching.
+    """
+    return expected is not None and entry_id is not None and str(entry_id) != str(expected)
+
+
+def precomputed_covers_season(
+    cache_dir, show_name: str, season: int, manifest=None, expected_tmdb_id=None
+) -> bool:
     """Return True when the precomputed vector cache fully covers show+season.
 
     Mirrors the gate EpisodeMatcher applies at match time (manifest validity,
@@ -71,6 +84,13 @@ def precomputed_covers_season(cache_dir, show_name: str, season: int, manifest=N
 
     ``manifest`` may be a pre-loaded manifest dict to avoid re-reading and
     re-validating manifest.json (callers holding a cached copy pass it in).
+
+    ``expected_tmdb_id`` is the TMDB id the calling job has resolved for the
+    show. When supplied, it is compared against the manifest entry's ``tmdb_id``
+    (string comparison); a mismatch means the corpus is for a *different*
+    same-named show (e.g. Frasier 1993 vs 2023 revival) and this function
+    returns False before inspecting any on-disk files. When either id is
+    unknown the guard is skipped (backward-compatible).
     """
     if manifest is None:
         manifest = load_precomputed_manifest(cache_dir)
@@ -79,6 +99,13 @@ def precomputed_covers_season(cache_dir, show_name: str, season: int, manifest=N
 
     show_entry = manifest.get("shows", {}).get(show_name)
     if not show_entry or season not in show_entry.get("seasons", []):
+        return False
+
+    # Corpus guard: if the job knows its TMDB id and it contradicts the
+    # manifest entry's id, this precomputed corpus is for a DIFFERENT same-named
+    # show — refuse it so we never match e.g. the Frasier 2023 revival against the
+    # 1993 corpus. Skipped when either id is unknown (backward-compatible).
+    if _tmdb_id_mismatch(expected_tmdb_id, show_entry.get("tmdb_id")):
         return False
 
     show_dir = Path(cache_dir) / "precomputed" / sanitize_filename(show_name)
@@ -746,10 +773,12 @@ class EpisodeMatcher:
         min_vote_count=2,
         match_threshold=0.10,
         model_name="small",
+        expected_tmdb_id=None,
     ):
         self.cache_dir = Path(cache_dir)
         self.min_confidence = min_confidence
         self.show_name = show_name
+        self.expected_tmdb_id = expected_tmdb_id
         self.chunk_duration = 30
         self.skip_initial_duration = (
             90  # Minimal skip for title cards; ranked voting handles intro noise
@@ -906,11 +935,25 @@ class EpisodeMatcher:
         # reuse it for the coverage gate so we read+validate manifest.json at most
         # once per matcher instance instead of once per title.
         manifest = self._load_precomputed_manifest()
+        # Corpus guard: a positive tmdb_id mismatch means the manifest entry is a
+        # different same-named show. Bail BEFORE the stale-prune branch so we don't
+        # wrongly drop a valid entry whose files are present.
+        show_entry = (manifest or {}).get("shows", {}).get(self.show_name)
+        entry_id = show_entry.get("tmdb_id") if show_entry else None
+        if _tmdb_id_mismatch(self.expected_tmdb_id, entry_id):
+            logger.warning(
+                f"Precomputed corpus for '{self.show_name}' is tmdb_id {entry_id} but this "
+                f"job resolved tmdb_id {self.expected_tmdb_id}; skipping precomputed (wrong show)"
+            )
+            return None
         if not precomputed_covers_season(
-            self.cache_dir, self.show_name, season_number, manifest=manifest
+            self.cache_dir,
+            self.show_name,
+            season_number,
+            manifest=manifest,
+            expected_tmdb_id=self.expected_tmdb_id,
         ):
             # Prune the stale season in-memory so the warning fires at most once per matcher.
-            show_entry = (manifest or {}).get("shows", {}).get(self.show_name)
             if show_entry and season_number in show_entry.get("seasons", []):
                 logger.warning(
                     f"Precomputed cache lists {self.show_name} S{season_number:02d} "

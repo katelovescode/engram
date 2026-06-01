@@ -272,11 +272,25 @@ class IdentificationCoordinator:
                     )
                     return
 
+                # Compute ambiguous-identity flag before the TMDB-lookup-failed guard so
+                # same-name collisions (which withhold tmdb_id by design) are not
+                # intercepted with the generic "words merged" message.
+                _signal = getattr(analysis, "_tmdb_signal", None)
+                _amb = bool(_signal and _signal.ambiguous_identity)
+
                 # TV show detected but TMDB lookup failed — name cannot be trusted for episode
                 # matching. Block ripping until the user confirms the correct show name.
                 # (Disc-name fallback already ran in _run_classification; if we reach here,
                 # neither the volume label nor the DINFO name resolved on TMDB.)
-                if job.content_type == ContentType.TV and not job.tmdb_id and job.detected_title:
+                # Exclude ambiguous-identity jobs: they have tmdb_id=None by design and
+                # carry a candidate-naming review_reason that the needs_review branch below
+                # will surface.
+                if (
+                    job.content_type == ContentType.TV
+                    and not job.tmdb_id
+                    and job.detected_title
+                    and not _amb
+                ):
                     reason = (
                         f'Could not find "{job.detected_title}" on TMDB — the disc label '
                         f"may have words merged without separators. "
@@ -303,13 +317,18 @@ class IdentificationCoordinator:
                     )
                     return
 
-                # Start subtitle download for ALL TV content
+                # Start subtitle download for ALL TV content — except when identity is
+                # ambiguous (same-name collision). Downloading by the tentative name would
+                # fetch the wrong show's subtitles before the user disambiguates.
                 if (
                     job.content_type == ContentType.TV
                     and job.detected_title
                     and job.detected_season
+                    and not _amb
                 ):
-                    self._start_subtitle_download(job_id, job.detected_title, job.detected_season)
+                    self._start_subtitle_download(
+                        job_id, job.detected_title, job.detected_season, job.tmdb_id
+                    )
                     logger.info(
                         f"Job {job_id}: starting subtitle download for "
                         f"{job.detected_title} S{job.detected_season}"
@@ -364,6 +383,9 @@ class IdentificationCoordinator:
                     await session.commit()
 
                 # Both review and high-confidence paths broadcast the same job update.
+                # review_reason is None for the high-confidence path (omitted by the
+                # broadcaster) and carries the candidate-naming reason for review jobs —
+                # the ReIdentifyModal needs it to show why the disc needs disambiguation.
                 await ws_manager.broadcast_job_update(
                     job_id,
                     job.state.value,
@@ -371,6 +393,7 @@ class IdentificationCoordinator:
                     detected_title=job.detected_title,
                     detected_season=job.detected_season,
                     total_titles=job.total_titles,
+                    review_reason=analysis.review_reason,
                 )
 
                 if analysis.needs_review:
@@ -518,12 +541,34 @@ class IdentificationCoordinator:
                     )
                     return
 
+                # Same-name collision (item 1): route to review with the candidate list
+                # instead of matching against the wrong same-named show's corpus by name.
+                _amb_signal = getattr(analysis, "_tmdb_signal", None)
+                if _amb_signal and _amb_signal.ambiguous_identity:
+                    await self._state_machine.transition_to_review(
+                        job, session, reason=analysis.review_reason, broadcast=False
+                    )
+                    await ws_manager.broadcast_job_update(
+                        job_id,
+                        JobState.REVIEW_NEEDED.value,
+                        content_type=job.content_type.value,
+                        detected_title=job.detected_title,
+                        detected_season=job.detected_season,
+                        total_titles=job.total_titles,
+                        review_reason=analysis.review_reason,
+                    )
+                    logger.info(
+                        f"Job {job_id}: ambiguous identity for '{job.detected_title}', "
+                        f"routing to REVIEW_NEEDED"
+                    )
+                    return
+
                 # Skip ripping — files already exist. Proceed to matching/organization.
                 if job.content_type == ContentType.TV:
                     # Start subtitle download
                     if job.detected_title and job.detected_season:
                         self._start_subtitle_download(
-                            job_id, job.detected_title, job.detected_season
+                            job_id, job.detected_title, job.detected_season, job.tmdb_id
                         )
                     elif job.detected_title and self._start_subtitle_download_all_seasons:
                         # Season unknown (flat import folder): prefetch references for
@@ -737,7 +782,7 @@ class IdentificationCoordinator:
                 and self._restart_subtitle_download is not None
             )
             restart_args = (
-                (job_id, job.detected_title, job.detected_season)
+                (job_id, job.detected_title, job.detected_season, job.tmdb_id)
                 if should_restart_subtitles
                 else None
             )
