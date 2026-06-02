@@ -52,7 +52,7 @@ from rich.progress import (
 from scipy import sparse
 
 from app.matcher import coverage_tracker
-from app.matcher.episode_identification import SubtitleCache
+from app.matcher.episode_identification import SubtitleCache, _corpus_show_dir
 from app.matcher.subtitle_utils import discover_season_srts, sanitize_filename
 from app.matcher.testing_service import download_subtitles, get_last_quota, probe_os_quota
 from app.matcher.tmdb_client import (
@@ -260,6 +260,10 @@ def _harvest_show(
     """
     harvested: list[tuple[int, str, Path]] = []
     canonical = show["name"]
+    # The data/ SRT scrape cache stays NAME-keyed (it must match where
+    # download_subtitles writes and what normalize_subtitle_cache processes —
+    # re-keying data/ by tmdb_id is a separate follow-up). Only the precomputed
+    # OUTPUT below is keyed by tmdb_id.
     season_data_dir = cache_dir / "data" / sanitize_filename(canonical)
     for season in range(1, show["seasons"] + 1):
         # Complete-on-disk fast path: a season that previously reached the
@@ -515,8 +519,8 @@ def main() -> int:
 
     # --- Harvest SRT + extract cleaned full text per episode -------------------
     subtitle_cache = SubtitleCache()
-    # blocks: list of (show_name, season, [episode_codes], count_csr)
-    blocks: list[tuple[str, int, list[str], object]] = []
+    # blocks: list of (tmdb_id, show_name, season, [episode_codes], count_csr)
+    blocks: list[tuple[int, str, int, list[str], object]] = []
     hv = build_hashing_vectorizer()
     manifest_shows: dict[str, dict] = {}
     tally = RunTally()
@@ -610,13 +614,16 @@ def main() -> int:
                 if not texts:
                     continue
                 counts = hv.transform(texts)  # raw hashed term counts
-                blocks.append((show["name"], season, codes, counts))
+                blocks.append((show["tmdb_id"], show["name"], season, codes, counts))
                 show_seasons.append(season)
                 episode_counts[str(season)] = len(codes)
 
             if show_seasons:
-                manifest_shows[show["name"]] = {
+                # v3: keyed by tmdb_id so same-named shows don't collide; the name
+                # is stored so the runtime can still resolve when no id is known.
+                manifest_shows[str(show["tmdb_id"])] = {
                     "tmdb_id": show["tmdb_id"],
+                    "name": show["name"],
                     "seasons": show_seasons,
                     "episode_counts": episode_counts,
                 }
@@ -626,7 +633,7 @@ def main() -> int:
         return 1
 
     # --- Fit one global IDF across the whole corpus ----------------------------
-    all_counts = sparse.vstack([b[3] for b in blocks], format="csr")
+    all_counts = sparse.vstack([b[4] for b in blocks], format="csr")
     idf = compute_idf(all_counts)
     np.save(precomputed_dir / "idf.npy", idf)
     logger.info(f"Global IDF fit over {all_counts.shape[0]} episodes")
@@ -639,8 +646,10 @@ def main() -> int:
     # .npz collapses the long runs of 1s much better than it ever could on
     # floats — measured ~85% reduction (~8 KB/episode vs. ~66 KB for v1).
     u16_max = np.iinfo(np.uint16).max
-    for show_name, season, codes, counts in blocks:
-        show_dir = precomputed_dir / sanitize_filename(show_name)
+    for tmdb_id_b, _show_name, season, codes, counts in blocks:
+        # Write to the runtime's canonical id-keyed dir (matches the str(tmdb_id)
+        # manifest key) via the shared formula so write/read can't drift.
+        show_dir = _corpus_show_dir(cache_dir, str(tmdb_id_b))
         show_dir.mkdir(parents=True, exist_ok=True)
         # HashingVectorizer emits float64 counts even with alternate_sign=False;
         # cast to uint16 (clipped defensively — real per-episode token counts
@@ -691,7 +700,7 @@ def main() -> int:
             shutil.rmtree(data_dir)
             logger.info("Deleted harvested SRT files (--clean-srt)")
 
-    total_episodes = sum(len(c) for _, _, c, _ in blocks)
+    total_episodes = sum(len(c) for _, _, _, c, _ in blocks)
     size_mb = output_path.stat().st_size / (1024 * 1024)
     logger.info(
         f"Built cache: {len(manifest_shows)} shows, {total_episodes} episodes, "
