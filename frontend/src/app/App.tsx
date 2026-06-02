@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "motion/react";
-import { Trash2, LayoutGrid, List, Info, X } from "lucide-react";
+import { AlertTriangle, Trash2, LayoutGrid, List, Info, X } from "lucide-react";
 import { DiscCard, type DiscData } from "./components/DiscCard";
 import { useJobManagement } from "./hooks/useJobManagement";
 import { useDiscFilters } from "./hooks/useDiscFilters";
@@ -383,6 +383,83 @@ function MainDashboard() {
                 }}
                 onMouseEnter={(e) => { e.currentTarget.style.color = sv.cyanHi; }}
                 onMouseLeave={(e) => { e.currentTarget.style.color = `${sv.cyan}99`; }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* TMDB health banner */}
+      <AnimatePresence>
+        {!tmdbConfigured && !tmdbBannerDismissed && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="max-w-[1600px] mx-auto px-4 sm:px-6 mt-4"
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 12,
+                padding: "12px 16px",
+                background: `${sv.amber}10`,
+                border: `1px solid ${sv.amber}55`,
+                boxShadow: `0 0 12px ${sv.amber}22`,
+              }}
+            >
+              <AlertTriangle size={18} color={sv.amber} style={{ flexShrink: 0, marginTop: 1 }} />
+              <div
+                style={{
+                  flex: 1,
+                  fontFamily: sv.mono,
+                  fontSize: 12,
+                  letterSpacing: "0.06em",
+                  color: sv.amber,
+                  lineHeight: 1.45,
+                }}
+              >
+                <span>TMDB not configured — classification is running in heuristic-only mode. </span>
+                <button
+                  onClick={() => setShowSettings(true)}
+                  style={{
+                    fontFamily: "inherit",
+                    fontSize: "inherit",
+                    color: sv.amber,
+                    textDecoration: "underline",
+                    textUnderlineOffset: 2,
+                    background: "none",
+                    border: 0,
+                    padding: 0,
+                    cursor: "pointer",
+                  }}
+                >
+                  Configure token
+                </button>
+                <span>.</span>
+              </div>
+              <button
+                onClick={() => setTmdbBannerDismissed(true)}
+                title="Dismiss"
+                aria-label="Dismiss TMDB warning"
+                style={{
+                  flexShrink: 0,
+                  width: 24,
+                  height: 24,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "transparent",
+                  border: 0,
+                  color: `${sv.amber}99`,
+                  cursor: "pointer",
+                  transition: "color 120ms",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = sv.amber; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = `${sv.amber}99`; }}
               >
                 <X size={14} />
               </button>
