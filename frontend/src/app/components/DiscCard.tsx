@@ -81,6 +81,8 @@ interface DiscCardProps {
   onReIdentify?: () => void;
   onAdvance?: () => void;
   onReportBug?: () => void;
+  tmdbConfigured?: boolean;
+  onOpenSettings?: () => void;
 }
 
 /**
@@ -174,7 +176,7 @@ function CoverOverlay({ children }: { children: React.ReactNode }) {
 }
 
 const DiscCardComponent = React.forwardRef<HTMLDivElement, DiscCardProps>(
-  ({ disc, onCancel, onReview, onReIdentify, onAdvance, onReportBug }, ref) => {
+  ({ disc, onCancel, onReview, onReIdentify, onAdvance, onReportBug, tmdbConfigured = true, onOpenSettings }, ref) => {
     const [isHovered, setIsHovered] = React.useState(false);
     const posterUrl = usePosterImage(disc.id, disc.title);
     const isActive = !['completed', 'error', 'idle'].includes(disc.state);
@@ -400,6 +402,51 @@ const DiscCardComponent = React.forwardRef<HTMLDivElement, DiscCardProps>(
                   <span>
                     {disc.subtitleError ||
                       "No subtitles found — episode matching can't run. Open to assign episodes manually."}
+                  </span>
+                </div>
+              )}
+
+              {/* TMDB not-configured warning — shown on active jobs only */}
+              {tmdbConfigured === false && isActive && (
+                <div
+                  role="alert"
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 8,
+                    marginBottom: 16,
+                    padding: "10px 12px",
+                    border: `1px solid ${sv.amber}`,
+                    borderLeft: `3px solid ${sv.amber}`,
+                    background: "rgba(252, 211, 77, 0.08)",
+                    fontFamily: sv.mono,
+                    fontSize: 12,
+                    lineHeight: 1.45,
+                    letterSpacing: "0.02em",
+                    color: sv.amber,
+                  }}
+                >
+                  <span aria-hidden style={{ flexShrink: 0 }}>⚠</span>
+                  <span>
+                    TMDB not configured — classification is heuristic-only.{" "}
+                    {onOpenSettings && (
+                      <button
+                        onClick={onOpenSettings}
+                        style={{
+                          fontFamily: "inherit",
+                          fontSize: "inherit",
+                          color: sv.amber,
+                          textDecoration: "underline",
+                          textUnderlineOffset: 2,
+                          background: "none",
+                          border: 0,
+                          padding: 0,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Configure token
+                      </button>
+                    )}
                   </span>
                 </div>
               )}

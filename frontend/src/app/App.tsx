@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "motion/react";
-import { Trash2, LayoutGrid, List, Info, X } from "lucide-react";
+import { AlertTriangle, Trash2, LayoutGrid, List, Info, X } from "lucide-react";
 import { DiscCard, type DiscData } from "./components/DiscCard";
 import { useJobManagement } from "./hooks/useJobManagement";
 import { useDiscFilters } from "./hooks/useDiscFilters";
@@ -66,39 +66,40 @@ function MainDashboard() {
   const [viewMode, setViewMode] = useState<ViewMode>("expanded");
   const [platform, setPlatform] = useState<string | null>(null);
   const [bannerDismissed, setBannerDismissed] = useState(false);
+  const [tmdbConfigured, setTmdbConfigured] = useState(true);
+  const [tmdbBannerDismissed, setTmdbBannerDismissed] = useState(false);
   const [contributionPending, setContributionPending] = useState(0);
 
   // Check for development mock mode
   const DEV_MODE = window.location.search.includes('mock=true');
 
   // Check if first-run setup is needed + fetch contribution badge count
-  useEffect(() => {
-    const checkSetup = async () => {
-      try {
-        const response = await fetch('/api/config');
-        if (!response.ok) return;
-        const data = await response.json();
-        if (!data.setup_complete) {
-          setShowOnboarding(true);
-        }
-        // Fetch contribution stats for nav badge
-        if (FEATURES.DISCDB && data.discdb_contributions_enabled) {
-          try {
-            const statsRes = await fetch('/api/contributions/stats');
-            if (statsRes.ok) {
-              const stats = await statsRes.json();
-              setContributionPending(stats.pending);
-            }
-          } catch {
-            // Non-critical
-          }
-        }
-      } catch {
-        // Backend not reachable — don't block the UI
+  const checkSetup = async () => {
+    try {
+      const response = await fetch('/api/config');
+      if (!response.ok) return;
+      const data = await response.json();
+      if (!data.setup_complete) {
+        setShowOnboarding(true);
       }
-    };
-    checkSetup();
-  }, []);
+      setTmdbConfigured(!!data.tmdb_api_key);
+      // Fetch contribution stats for nav badge
+      if (FEATURES.DISCDB && data.discdb_contributions_enabled) {
+        try {
+          const statsRes = await fetch('/api/contributions/stats');
+          if (statsRes.ok) {
+            const stats = await statsRes.json();
+            setContributionPending(stats.pending);
+          }
+        } catch {
+          // Non-critical
+        }
+      }
+    } catch {
+      // Backend not reachable — don't block the UI
+    }
+  };
+  useEffect(() => { checkSetup(); }, []);
 
   // Detect platform for non-Windows guidance banner
   useEffect(() => {
@@ -388,6 +389,83 @@ function MainDashboard() {
         )}
       </AnimatePresence>
 
+      {/* TMDB health banner */}
+      <AnimatePresence>
+        {!tmdbConfigured && !tmdbBannerDismissed && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="max-w-[1600px] mx-auto px-4 sm:px-6 mt-4"
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 12,
+                padding: "12px 16px",
+                background: `${sv.amber}10`,
+                border: `1px solid ${sv.amber}55`,
+                boxShadow: `0 0 12px ${sv.amber}22`,
+              }}
+            >
+              <AlertTriangle size={18} color={sv.amber} style={{ flexShrink: 0, marginTop: 1 }} />
+              <div
+                style={{
+                  flex: 1,
+                  fontFamily: sv.mono,
+                  fontSize: 12,
+                  letterSpacing: "0.06em",
+                  color: sv.amber,
+                  lineHeight: 1.45,
+                }}
+              >
+                <span>TMDB not configured — classification is running in heuristic-only mode. </span>
+                <button
+                  onClick={() => setShowSettings(true)}
+                  style={{
+                    fontFamily: "inherit",
+                    fontSize: "inherit",
+                    color: sv.amber,
+                    textDecoration: "underline",
+                    textUnderlineOffset: 2,
+                    background: "none",
+                    border: 0,
+                    padding: 0,
+                    cursor: "pointer",
+                  }}
+                >
+                  Configure token
+                </button>
+                <span>.</span>
+              </div>
+              <button
+                onClick={() => setTmdbBannerDismissed(true)}
+                title="Dismiss"
+                aria-label="Dismiss TMDB warning"
+                style={{
+                  flexShrink: 0,
+                  width: 24,
+                  height: 24,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "transparent",
+                  border: 0,
+                  color: `${sv.amber}99`,
+                  cursor: "pointer",
+                  transition: "color 120ms",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = sv.amber; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = `${sv.amber}99`; }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Main Content */}
       <div className="max-w-[1600px] mx-auto px-4 sm:px-6 py-6 sm:py-8 pb-24 sm:pb-28 relative z-0">
         <div
@@ -542,6 +620,8 @@ function MainDashboard() {
                     if (job) setReIdentifyTarget(job);
                   } : undefined}
                   onReportBug={() => setBugReportJobId(Number(disc.id))}
+                  tmdbConfigured={tmdbConfigured}
+                  onOpenSettings={() => setShowSettings(true)}
                 />
               ))}
             </AnimatePresence>
@@ -650,7 +730,7 @@ function MainDashboard() {
         <ModalScrim>
           <ConfigWizard
             onClose={() => setShowOnboarding(false)}
-            onComplete={() => setShowOnboarding(false)}
+            onComplete={() => { setShowOnboarding(false); checkSetup(); }}
             isOnboarding={true}
           />
         </ModalScrim>
@@ -663,6 +743,7 @@ function MainDashboard() {
             onClose={() => setShowSettings(false)}
             onComplete={() => {
               setShowSettings(false);
+              checkSetup();
             }}
             isOnboarding={false}
           />
