@@ -64,6 +64,7 @@ nav:
     - LLM Episode Matcher: guide/llm-episode-matcher.md
   - Deployment:
     - Docker (Linux): deployment/docker.md
+    - TrueNAS SCALE: deployment/truenas.md
   - Architecture:
     - Overview: architecture/overview.md
     - State Machine: architecture/state-machine.md
