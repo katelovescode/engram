@@ -839,7 +839,12 @@ class DiscAnalyst:
         MakeMKV provides disc names like:
           "Star Trek: Strange New Worlds - Season 3 (Disc 1)"
           "The Office - Season 2"
+          "Supernatural Season 11 Disc 2"   # space- or dash-separated disc, no parens
           "Inception"
+
+        The trailing disc indicator is accepted with or without parentheses or a
+        dash ("(Disc 1)", "Disc 1", "- Disc 1"), so the season is recovered even
+        when it sits ahead of a bare "Disc N" suffix.
 
         Returns (show_title, season), either may be None if not found.
         """
@@ -849,8 +854,13 @@ class DiscAnalyst:
         name = disc_name.strip()
         season: int | None = None
 
-        # Strip trailing " (Disc N)" or " (Disk N)"
-        name = re.sub(r"\s*\(Dis[ck]\s*\d+\)\s*$", "", name, flags=re.IGNORECASE).strip()
+        # Strip a trailing disc indicator with OR without parentheses/dash:
+        # "(Disc 1)", "Disc 1", "- Disc 1", "Disk 1", "Disc1". Without this, a
+        # space-separated "Disc N" survives and leaves "Season N" mid-string,
+        # so the end-anchored season patterns below never match (issue #303).
+        name = re.sub(
+            r"\s*[-–]?\s*\(?\s*Dis[ck]\s*\d+\s*\)?\s*$", "", name, flags=re.IGNORECASE
+        ).strip()
 
         # Extract "- Season N" or "Season N" suffix
         m = re.search(r"\s*[-–]\s*Season\s+(\d+)\s*$", name, re.IGNORECASE)
