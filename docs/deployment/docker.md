@@ -128,15 +128,19 @@ which is slower but needs no GPU. A CUDA image variant may be offered later.
 
   **Fix:** {: #libredrive--sdf-scan-hang }
 
-  1. Find your drive's model string. Start the container **without a disc
-     inserted** (no hang risk), then run:
+  1. Find your drive's model string:
      ```bash
-     docker exec engram makemkvcon -r --debug info disc:9999 2>&1 | grep -i "sdf\|DRV:"
+     docker exec engram /config/makemkv/bin/makemkvcon f -l
      ```
-     The string has the format `Manufacturer_Model_Firmware_Date_Serial`, e.g.
-     `ASUS_BW-16D1HT_3.11_212012011759_KLTO9CF4939`. The date+serial portion
-     is unit-specific. Look for lines containing `SDF` — those show the exact
-     format to use. The `DRV:` lines confirm the drive is visible to MakeMKV.
+     Output looks like:
+     ```
+     Found 1 drives(s)
+     00: dev_21:4, /dev/sr0, /dev/sr0
+       ASUS_BW-16D1HT_3.11_212012011759_KLTO9CF4939
+     ```
+     The indented line is your model string. Format is
+     `Manufacturer_Model_Firmware_Date_Serial` — the date and serial are
+     unit-specific, so your string will differ from the example.
 
   2. Set `SDF_STOP` in `docker-compose.yml`:
      ```yaml

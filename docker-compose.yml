@@ -50,8 +50,8 @@ services:
       # ~10 minutes (common on Blu-ray drives). Set to your drive's model string:
       #   Manufacturer_Model_Firmware_Date_Serial
       # e.g.: ASUS_BW-16D1HT_3.11_212012011759_KLTO9CF4939
-      # Run without a disc, then: docker exec engram makemkvcon -r --debug info
-      # disc:9999 2>&1 | grep -i "sdf\|DRV:" — see docs/deployment/docker.md.
+      # Run: docker exec engram /config/makemkv/bin/makemkvcon f -l
+      # The model string is the indented line under your drive. See docs/deployment/docker.md.
       # SDF_STOP: ""
 
     volumes:
