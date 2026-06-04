@@ -92,6 +92,16 @@ class EventBroadcaster:
             title.job_id, title.id, state=TitleState.RIPPING.value, match_progress=progress_percent
         )
 
+    async def broadcast_title_queued(self, title: DiscTitle):
+        """Broadcast that a title is enqueued for matching (waiting for a slot)."""
+        await self._ws.broadcast_title_update(
+            title.job_id,
+            title.id,
+            state=TitleState.QUEUED.value,
+            duration_seconds=title.duration_seconds,
+            file_size_bytes=title.file_size_bytes,
+        )
+
     async def broadcast_title_matching_started(self, title: DiscTitle):
         """Broadcast title matching started."""
         await self._ws.broadcast_title_update(

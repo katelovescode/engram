@@ -909,7 +909,20 @@ class MatchingCoordinator:
                 logger.info(
                     f"[MATCH] Title {title_id} (Job {job_id}): calling episode_curator.match_single_file for {file_path.name}"
                 )
-                result = await episode_curator.match_single_file(
+                # Queue-aware safety net: bound a single match by the per-track
+                # ceiling (reuses timeout_matching_seconds; 0/None = no limit). The
+                # clock starts here — i.e. only once a slot is acquired and matching
+                # is underway — so a track merely waiting in the QUEUED line is never
+                # penalized. On timeout, wait_for cancels the matcher coroutine, which
+                # unwinds to _run_match_single_file's `finally` and releases the
+                # semaphore so the next QUEUED track gets the freed slot. (If the
+                # matcher offloaded blocking ASR to a thread, the slot still frees;
+                # the orphaned thread runs to process exit — acceptable.)
+                from app.services.config_service import get_config
+
+                _cfg = await get_config()
+                match_ceiling = _cfg.timeout_matching_seconds if _cfg else 0
+                _match_coro = episode_curator.match_single_file(
                     file_path,
                     series_name=job.detected_title,
                     season=job.detected_season,
@@ -918,6 +931,43 @@ class MatchingCoordinator:
                     min_vote_count=min_vote_count,
                     tmdb_id=job.tmdb_id,
                 )
+                try:
+                    if match_ceiling and match_ceiling > 0:
+                        result = await asyncio.wait_for(_match_coro, timeout=match_ceiling)
+                    else:
+                        result = await _match_coro
+                except TimeoutError:
+                    logger.warning(
+                        f"[MATCH] Title {title_id} (Job {job_id}): match timed out after "
+                        f"{match_ceiling}s — routing to review. The forced_review flag stops "
+                        f"review-escalation from re-dispatching it into a timeout loop."
+                    )
+                    title.state = TitleState.REVIEW
+                    # Merge, don't overwrite: a concurrent skip_title may have stamped
+                    # its own forced_review reason while this match was running. Preserve
+                    # it (setdefault) so the audit trail isn't rewritten to "timed out".
+                    # Mirrors JobManager._forced_review_details.
+                    _md: dict = {}
+                    if title.match_details:
+                        try:
+                            parsed = json.loads(title.match_details)
+                            if isinstance(parsed, dict):
+                                _md = parsed
+                        except (json.JSONDecodeError, TypeError):
+                            _md = {}
+                    _md["forced_review"] = True
+                    _md.setdefault("reason", f"match timed out after {match_ceiling}s")
+                    title.match_details = json.dumps(_md)
+                    session.add(title)
+                    await session.commit()
+                    await ws_manager.broadcast_title_update(
+                        job_id,
+                        title_id,
+                        title.state.value,
+                        match_details=title.match_details,
+                    )
+                    await self._check_job_completion(session, job_id)
+                    return
 
                 elapsed = time.monotonic() - match_start
 
@@ -1490,6 +1540,7 @@ class MatchingCoordinator:
             active_states = (
                 TitleState.PENDING,
                 TitleState.RIPPING,
+                TitleState.QUEUED,
                 TitleState.MATCHING,
             )
             if title and title.state in active_states:
