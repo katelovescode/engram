@@ -108,9 +108,11 @@ If disc scans time out after ~10 minutes, you're hitting a MakeMKV SDF lookup
 hang. See the [Docker deployment docs](docker.md#libredrive--sdf-scan-hang) for
 the full fix. For TrueNAS:
 
-1. Find your drive model string and add `SDF_STOP` to the custom app environment.
-2. Copy `sdf.bin` to `/mnt/tank/appdata/engram/data/sdf.bin` and restart the
-   container so MakeMKV ingests it.
+1. Find your drive model string and add `SDF_STOP` to the custom app environment,
+   then restart the container.
+
+`SDF_STOP` alone is sufficient — it resolves the hang and achieves LibreDrive
+speeds. The `sdf.bin` seeding step does not apply to Engram's container context.
 
 ## Troubleshooting
 

@@ -156,11 +156,10 @@ which is slower but needs no GPU. A CUDA image variant may be offered later.
        SDF_STOP: "ASUS_BW-16D1HT_3.11_212012011759_KLTO9CF4939"
      ```
 
-  3. *(Optional but recommended for full LibreDrive speed)* Obtain `sdf.bin` for
-     your drive from your existing MakeMKV installation (it is stored inside
-     `_private_data.tar` in the MakeMKV config directory). Place it at
-     `<config-volume>/data/sdf.bin` before starting the container. MakeMKV ingests
-     it into `_private_data.tar` on startup, enabling LibreDrive speeds of
-     22–27 MB/s instead of 5–6 MB/s.
+  3. `docker compose up -d` to restart with the new env var.
 
-  4. `docker compose up -d` to restart with the new env var.
+  **That's it.** In testing, `SDF_STOP` alone resolved the hang and produced
+  LibreDrive rip speeds (21+ MB/s). The `sdf.bin` seeding step sometimes
+  documented for native MakeMKV installs does not apply here — Engram's container
+  compiles MakeMKV into its own config volume and the `sdf.bin` path is not
+  consumed in that context.
