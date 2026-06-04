@@ -46,12 +46,10 @@ services:
       # "latest" tracks the current MakeMKV release; pin a version (e.g. 1.18.1)
       # for reproducible builds.
       MAKEMKV_VERSION: "latest"
-      # LibreDrive SDF hang fix — uncomment and set if disc scans time out after
-      # ~10 minutes (common on Blu-ray drives). Set to your drive's model string:
-      #   Manufacturer_Model_Firmware_Date_Serial
-      # e.g.: ASUS_BW-16D1HT_3.11_212012011759_KLTO9CF4939
-      # Run: docker exec engram /config/makemkv/bin/makemkvcon f -l
-      # The model string is the indented line under your drive. See docs/deployment/docker.md.
+      # LibreDrive SDF hang fix — if disc scans hang indefinitely, you may be
+      # hitting a MakeMKV bug (1.17.8+) affecting Linux with certain drives.
+      # See docs/deployment/docker.md#libredrive--sdf-scan-hang for how to check
+      # and get your model string (Manufacturer_Model_Firmware_Date_Serial).
       # SDF_STOP: ""
 
     volumes:

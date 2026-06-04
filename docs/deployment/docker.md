@@ -122,11 +122,19 @@ which is slower but needs no GPU. A CUDA image variant may be offered later.
 - **Library files are root-owned** — set `PUID`/`PGID` to your host user.
 - **The dashboard loads but nothing rips on Windows/macOS** — expected; optical
   passthrough is Linux-only.
-- **Disc scan hangs for ~10 minutes then fails ("timed out after 10 minutes")** — this
-  is the LibreDrive SDF lookup hang. MakeMKV attempts a network SDF lookup at startup
-  when a disc is present; on some Blu-ray drives this hangs indefinitely.
+- **Disc scan hangs indefinitely or times out** — this may be the LibreDrive SDF
+  hang, a MakeMKV bug introduced in 1.17.8. During initialization, MakeMKV attempts
+  a network lookup to fetch SDF (Signature Definition File) data; on some configurations
+  this hangs indefinitely and prevents ripping from starting. Check whether your setup
+  matches before applying the fix:
 
-  **Fix:** {: #libredrive--sdf-scan-hang }
+  - Linux host (includes TrueNAS, Unraid, and other Linux-based systems)
+  - MakeMKV 1.17.8 or later
+  - Certain drive/firmware combinations — the ASUS BW-16D1HT on firmware 3.11 is a
+    confirmed case; other drives have been reported in community forums
+  - Network conditions where the SDF endpoint is slow or unreachable may also trigger it
+
+  If your setup matches: {: #libredrive--sdf-scan-hang }
 
   1. Find your drive's model string:
      ```bash
