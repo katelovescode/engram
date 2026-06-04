@@ -62,7 +62,7 @@ GHCR on each release.
 | `MAKEMKV_APP_KEY` | _(empty)_ | MakeMKV license / beta key. Written to MakeMKV's `settings.conf` on start. Can also be set later in the wizard. |
 | `MAKEMKV_VERSION` | `latest` | MakeMKV version to compile. Pin a number (e.g. `1.18.1`) for reproducibility. |
 | `MAKEMKV_SKIP_INSTALL` | _(unset)_ | Set to `1` to skip the MakeMKV compile (used for CI/smoke tests; ripping is unavailable). |
-| `SDF_STOP` | _(unset)_ | Drive model string to bypass MakeMKV's SDF network lookup at startup. Required on some Blu-ray drives to prevent disc scans from hanging. Format: `Manufacturer_Model_Firmware_Date_Serial`. See [LibreDrive / SDF scan hang](#libredrive--sdf-scan-hang) below. |
+| `SDF_STOP` | _(unset)_ | **Optional.** Only needed if you're experiencing the LibreDrive SDF hang (disc scans hang indefinitely on Linux with MakeMKV 1.17.8+). Set to your drive's model string (`Manufacturer_Model_Firmware_Date_Serial`). See [LibreDrive / SDF scan hang](#libredrive--sdf-scan-hang). |
 
 The server also honors `DATABASE_URL`, `HOST`, `PORT`, and `DEBUG` — these are
 preset in the image and rarely need changing.
