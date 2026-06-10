@@ -3,7 +3,7 @@ import { Trash2, SkipForward } from 'lucide-react';
 import { IcoRetry } from '../../app/components/icons';
 import { SvActionButton, SvBadge, SvLabel, SvNotice, SvPanel, sv } from '../../app/components/synapse';
 import { FEATURES, EPISODE_CONFIG } from '../../config/constants';
-import type { DiscTitle, Job } from '../../types';
+import type { DiscTitle } from '../../types';
 import type { Candidate, CoverageEntry } from './coverage';
 import type { LLMSuggestion, RosterEpisode } from './types';
 import type { LLMFeedback } from './llmFeedback';
@@ -32,12 +32,12 @@ function pct(value: number): string {
  */
 export function Inspector({
     title,
-    job,
     candidates,
     suggestion,
     selection,
     action,
     episodes,
+    season,
     coverage,
     holders,
     titleIndexById,
@@ -53,12 +53,13 @@ export function Inspector({
     onAcceptLLMSuggestion,
 }: {
     title: DiscTitle;
-    job: Job;
     candidates: Candidate[];
     suggestion: { code: string; name: string } | null;
     selection: string | undefined;
     action: TitleAction | undefined;
     episodes: RosterEpisode[];
+    /** Effective season for manual/LLM codes: detected, else picker choice, else 1 (#370). */
+    season: number;
     coverage: Record<string, CoverageEntry>;
     /** Episode code → title ids claiming it (roster-independent collision source). */
     holders: Map<string, number[]>;
@@ -82,7 +83,6 @@ export function Inspector({
     // message). The parent flag clears the instant the fire-and-forget POST returns,
     // so the title state is what keeps the spinner up while matching actually runs.
     const isMatching = title.state === 'matching' || isRematching;
-    const season = job.detected_season ?? 1;
 
     // The set of episode codes held by OTHER titles → conflict source. Derived
     // from live selections (not the roster) so collisions surface even when the
@@ -332,7 +332,7 @@ export function Inspector({
                                       </option>
                                   ))
                                 : generateEpisodeOptions(
-                                      job.detected_season || 1,
+                                      season,
                                       EPISODE_CONFIG.DEFAULT_EPISODES_PER_SEASON,
                                   ).map((code) => (
                                       <option key={code} value={code}>

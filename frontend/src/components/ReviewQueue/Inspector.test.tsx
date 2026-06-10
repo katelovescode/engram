@@ -2,7 +2,7 @@ import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { Inspector } from './Inspector';
-import type { DiscTitle, Job } from '../../types';
+import type { DiscTitle } from '../../types';
 import type { LLMFeedback } from './llmFeedback';
 
 function makeTitle(overrides: Partial<DiscTitle> = {}): DiscTitle {
@@ -22,40 +22,22 @@ function makeTitle(overrides: Partial<DiscTitle> = {}): DiscTitle {
     };
 }
 
-function makeJob(overrides: Partial<Job> = {}): Job {
-    return {
-        id: 1,
-        drive_id: 'E:',
-        volume_label: 'SHOW_S1D1',
-        content_type: 'tv',
-        state: 'review_needed',
-        current_speed: '',
-        eta_seconds: 0,
-        progress_percent: 0,
-        current_title: 0,
-        total_titles: 0,
-        error_message: null,
-        detected_title: 'Show',
-        detected_season: 1,
-        ...overrides,
-    };
-}
-
 function renderInspector(props: {
     title?: DiscTitle;
     llmFeedback?: LLMFeedback | null;
     isLlmMatching?: boolean;
     aiEpisodeMatchingEnabled?: boolean;
+    season?: number;
 } = {}) {
     return render(
         <Inspector
             title={props.title ?? makeTitle()}
-            job={makeJob()}
             candidates={[]}
             suggestion={null}
             selection={undefined}
             action={undefined}
             episodes={[]}
+            season={props.season ?? 1}
             coverage={{}}
             holders={new Map()}
             titleIndexById={{ 1: 1 }}
@@ -108,5 +90,18 @@ describe('Inspector — AI match feedback', () => {
         // The suggestion card renders instead of the feedback notice.
         expect(screen.getByText(/Suggested:/)).toBeInTheDocument();
         expect(screen.queryByText(/No confident AI match found\./)).not.toBeInTheDocument();
+    });
+});
+
+describe('Inspector — manual dropdown season (#370)', () => {
+    it('generates fallback episode codes for the provided season, not S01', () => {
+        renderInspector({ season: 3 });
+        expect(screen.getByRole('option', { name: 'S03E01' })).toBeInTheDocument();
+        expect(screen.queryByRole('option', { name: 'S01E01' })).not.toBeInTheDocument();
+    });
+
+    it('defaults to season 1 codes when season is 1', () => {
+        renderInspector({ season: 1 });
+        expect(screen.getByRole('option', { name: 'S01E01' })).toBeInTheDocument();
     });
 });
