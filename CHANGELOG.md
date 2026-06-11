@@ -4,6 +4,10 @@ All notable changes to Engram will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Settings is a jump-anywhere section list instead of a replay of the setup wizard** — opening Settings from the gear used to reopen the first-run wizard verbatim (titled "Setup Wizard", a linear five-step stepper that always started on step 1 with no hint the steps were clickable), so changing one preference meant knowing which step and collapsible hid it. It now opens as **Settings** with a section sidebar you can move through freely, and individual settings are deep-linkable: the "GPU available →" status badge now opens Settings directly on the GPU acceleration control — it previously dropped you on the unrelated Library Paths step — and the "TMDB not configured" warnings open straight to the TMDB token field. First-run onboarding is unchanged. (#388)
+
 ### Fixed
 
 - **A missing reference subtitle no longer silently sends an episode to Needs Review** — when the shipped subtitle-vector cache was missing a single episode (e.g. Mad Men S02E05), Engram skipped the subtitle download *and* matched against the incomplete set without ever noticing the gap, so the affected episode dead-ended in review with no match and an unreliable AI guess. Engram now compares the cache against the canonical episode list, fetches only the missing episode(s) when they can be obtained, and grafts a fetched subtitle into matching at runtime so it actually identifies the track. Any episode it still can't get a reference for is now flagged on the Review page's season roster (a warning glyph + hatch on the slot, plus a summary line) instead of failing silently — because subtitles are the source of truth for matching. Dropping the missing `.srt` into the subtitle cache also now makes the episode matchable on the next run.
