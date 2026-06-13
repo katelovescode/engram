@@ -35,6 +35,7 @@ from app.matcher.episode_identification import reference_coverage
 from app.matcher.tmdb_client import fetch_season_episodes, get_number_of_seasons
 from app.models import DiscJob, JobState
 from app.models.disc_job import ContentType, DiscTitle
+from app.services.identity_prompts import BLOCKING_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,11 @@ class JobResponse(BaseModel):
     tmdb_year: int | None = None
     destination_mode: str = "library"
     created_at: datetime | str | None = None
+    # Identity CTA for rip-first jobs (walk-away Phase B). Raw JSON string:
+    # {"kind": "name"|"season"|"reidentify", "reason": "<human text>"}.
+    # Null when no prompt is pending; set by identify_disc's B2 gates and
+    # cleared by the answer endpoints / B4 rip-end convergence.
+    identity_prompt_json: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -216,6 +222,8 @@ class JobDetailResponse(BaseModel):
     # JSON list of same-name TMDB twins (e.g. Frasier 1993 + 2023) recorded at
     # identify time; lets the UI offer "did you mean ...?" on a wrong-show review.
     candidates_json: str | None = None
+    # Identity CTA for rip-first jobs (walk-away Phase B) — see JobResponse.
+    identity_prompt_json: str | None = None
     # Transient auto-resolution note (e.g. "Resolving episode conflicts — pass 2 of 3"
     # / "Deep re-matching low-confidence titles — pass 1 of 3"). Set while the
     # finalization coordinator is auto-escalating; cleared on resolution.
@@ -872,6 +880,7 @@ async def build_job_detail(job: DiscJob, session: AsyncSession) -> dict:
         "error_message": job.error_message,
         "review_reason": job.review_reason,
         "candidates_json": job.candidates_json,
+        "identity_prompt_json": job.identity_prompt_json,
         "conflict_status": job.conflict_status,
         "tmdb_degraded_reason": job.tmdb_degraded_reason,
         "classification_source": job.classification_source,
@@ -1055,13 +1064,24 @@ async def set_job_name(
     req: SetNameRequest,
     job: DiscJob = Depends(get_job_or_404),
 ) -> dict:
-    """Set a user-provided name for a disc with unreadable volume label, then resume ripping."""
-    if job.state != JobState.REVIEW_NEEDED:
+    """Set a user-provided name for a disc with unreadable volume label and resume the pipeline.
+
+    Accepted while RIPPING too (walk-away B5): the non-blocking identity CTA can
+    be answered mid-rip — metadata updates and parked titles dispatch without
+    interrupting the rip.
+    """
+    if job.state not in (JobState.REVIEW_NEEDED, JobState.RIPPING):
         raise HTTPException(status_code=400, detail="Job is not awaiting name input")
 
     from app.services.job_manager import job_manager
 
-    await job_manager.set_name_and_resume(job.id, req.name, req.content_type, req.season)
+    try:
+        await job_manager.set_name_and_resume(job.id, req.name, req.content_type, req.season)
+    except ValueError as e:
+        # TOCTOU: the state check above read a snapshot; the coordinator
+        # re-validates on a fresh row and raises if the job moved on (e.g.
+        # the rip finished and organized between the check and the call).
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return {"status": "ok", "job_id": job.id}
 
 
@@ -1079,16 +1099,27 @@ async def re_identify_job(
     req: ReIdentifyRequest,
     job: DiscJob = Depends(get_job_or_404),
 ) -> dict:
-    """Re-identify a disc with user-corrected title, content type, and optional TMDB ID."""
-    if job.state != JobState.REVIEW_NEEDED:
+    """Re-identify a disc with user-corrected title, content type, and optional TMDB ID.
+
+    Accepted while RIPPING too (walk-away B5): a mid-rip answer updates the
+    metadata and dispatches parked titles without interrupting the rip.
+    """
+    if job.state not in (JobState.REVIEW_NEEDED, JobState.RIPPING):
         raise HTTPException(
             status_code=400,
-            detail=f"Job must be in review_needed state, currently: {job.state.value}",
+            detail=f"Job must be in review_needed or ripping state, currently: {job.state.value}",
         )
 
     from app.services.job_manager import job_manager
 
-    await job_manager.re_identify_job(job.id, req.title, req.content_type, req.season, req.tmdb_id)
+    try:
+        await job_manager.re_identify_job(
+            job.id, req.title, req.content_type, req.season, req.tmdb_id
+        )
+    except ValueError as e:
+        # TOCTOU: the state check above read a snapshot; the coordinator
+        # re-validates on a fresh row and raises if the job moved on.
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return {"status": "re-identifying", "job_id": job.id}
 
 
@@ -2179,6 +2210,10 @@ async def bootstrap_accept(
 # --- Simulation Endpoints (debug mode only) ---
 
 
+# Blocking kinds park titles; "season" is the one non-blocking shortcut CTA.
+_VALID_IDENTITY_PENDING = BLOCKING_KINDS | {"season"}
+
+
 class SimulateDiscRequest(BaseModel):
     """Request model for simulating a disc insertion."""
 
@@ -2192,12 +2227,32 @@ class SimulateDiscRequest(BaseModel):
     rip_speed_multiplier: int = 10
     force_review_needed: bool = False
     review_reason: str | None = None
+    identity_pending: str | None = None
+    """Inject a walk-away identity prompt on the RIPPING job (DEBUG only).
+
+    Allowed values: ``"name"`` | ``"season"`` | ``"reidentify"``.  Sets
+    ``identity_prompt_json`` with the real reason literal the frontend keys on
+    so E2E tests exercise the actual modal routing without a physical disc.
+    Blocking kinds (``name`` / ``reidentify``) park titles in QUEUED;
+    ``season`` lets titles dispatch normally.  When ``simulate_ripping=True``
+    and a blocking prompt is pending, the completed rip converges to
+    REVIEW_NEEDED (same as the real B4 path).
+    """
 
 
 @router.post("/simulate/insert-disc", dependencies=[Depends(require_debug)])
 async def simulate_insert_disc(req: SimulateDiscRequest) -> dict:
     """Simulate a disc insertion. Only available in debug mode."""
     from app.services.job_manager import job_manager
+
+    if req.identity_pending is not None and req.identity_pending not in _VALID_IDENTITY_PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"identity_pending must be one of {sorted(_VALID_IDENTITY_PENDING)!r}, "
+                f"got {req.identity_pending!r}"
+            ),
+        )
 
     params = req.model_dump()
     if not params.get("force_review_needed") and params.get("detected_title") is None:

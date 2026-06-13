@@ -30,6 +30,7 @@ async def _make_job(
     *,
     content_type: ContentType = ContentType.TV,
     state: JobState = JobState.MATCHING,
+    identity_prompt_json: str | None = None,
 ) -> int:
     async with db.async_session() as session:
         job = DiscJob(
@@ -38,6 +39,7 @@ async def _make_job(
             content_type=content_type,
             state=state,
             staging_path=str(staging),
+            identity_prompt_json=identity_prompt_json,
         )
         session.add(job)
         await session.commit()
@@ -133,6 +135,73 @@ async def test_reconcile_stuck_tv_with_file_queues_match(tmp_path, monkeypatch):
     # no-op, so the post-semaphore QUEUED→MATCHING flip never runs here).
     assert (await _title(tid)).state == TitleState.QUEUED
     assert called.get("match") == (job_id, tid, str(f))
+
+
+_IDENTITY_PROMPT = '{"kind": "name", "reason": "Disc label unreadable"}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_type", [ContentType.TV, ContentType.MOVIE])
+async def test_reconcile_stuck_identity_pending_parks_queued(tmp_path, monkeypatch, content_type):
+    """Identity gate (walk-away Phase B): with an unanswered identity prompt, a
+    recovered orphaned title parks in QUEUED — no matching dispatch, and no
+    non-TV fall-through to MATCHED (that would mark it matched with no
+    identity). dispatch_pending_matches releases it after the answer."""
+    f = tmp_path / "disc_t00.mkv"
+    f.write_bytes(b"x")
+    job_id = await _make_job(
+        tmp_path,
+        content_type=content_type,
+        state=JobState.RIPPING,
+        identity_prompt_json=_IDENTITY_PROMPT,
+    )
+    tid = await _add_title(job_id, 0, TitleState.RIPPING, output=str(f))
+
+    from unittest.mock import AsyncMock
+
+    discdb = AsyncMock(return_value=False)
+    dispatch = AsyncMock()
+    monkeypatch.setattr(job_manager._matching, "try_discdb_assignment", discdb)
+    monkeypatch.setattr(job_manager._matching, "match_single_file", dispatch)
+    monkeypatch.setattr(job_manager._matching, "on_match_task_done", lambda *a, **k: None)
+
+    await job_manager.reconcile_stuck_titles(job_id)
+    await asyncio.sleep(0.05)
+
+    assert (await _title(tid)).state == TitleState.QUEUED
+    discdb.assert_not_called()
+    dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stuck_season_prompt_dispatches_normally(tmp_path, monkeypatch):
+    """kind=season is a non-blocking shortcut CTA (B2): identity is confirmed,
+    so a recovered TV title dispatches into cross-season matching instead of
+    parking — a parked season-prompt job would hang forever (QUEUED titles
+    refresh the watchdog clock and nothing ever dispatches)."""
+    f = tmp_path / "disc_t00.mkv"
+    f.write_bytes(b"x")
+    job_id = await _make_job(
+        tmp_path,
+        content_type=ContentType.TV,
+        state=JobState.RIPPING,
+        identity_prompt_json='{"kind": "season", "reason": "select a season to continue."}',
+    )
+    tid = await _add_title(job_id, 0, TitleState.RIPPING, output=str(f))
+
+    from unittest.mock import AsyncMock
+
+    discdb = AsyncMock(return_value=False)
+    dispatch = AsyncMock()
+    monkeypatch.setattr(job_manager._matching, "try_discdb_assignment", discdb)
+    monkeypatch.setattr(job_manager._matching, "match_single_file", dispatch)
+    monkeypatch.setattr(job_manager._matching, "on_match_task_done", lambda *a, **k: None)
+
+    await job_manager.reconcile_stuck_titles(job_id)
+    await asyncio.sleep(0.05)
+
+    assert (await _title(tid)).state == TitleState.QUEUED  # MATCHING flip is post-semaphore
+    dispatch.assert_awaited_once()
 
 
 # --- QUEUED state: completion check treats it as active --------------------
@@ -494,6 +563,85 @@ async def test_watchdog_advances_genuinely_stale_ripping_job(tmp_path):
     assert (await _title(stuck)).state == TitleState.FAILED
 
 
+# --- watchdog × identity gate (walk-away B4) --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_leaves_healthy_identity_pending_rip_alone(tmp_path):
+    """(B4a) During a healthy rip with titles parked QUEUED behind an identity
+    prompt, the watchdog must not advance: RIPPING liveness is measured by rip
+    output growth (the fs monitor calls _note_activity on active file growth),
+    not by title-state advancement — so parked titles never make a live rip
+    look stale, and no QUEUED exemption is needed for the RIPPING phase."""
+    f = tmp_path / "disc_t00.mkv"
+    f.write_bytes(b"x")
+    job_id = await _make_job(
+        tmp_path, state=JobState.RIPPING, identity_prompt_json=_IDENTITY_PROMPT
+    )
+    parked = await _add_title(job_id, 0, TitleState.QUEUED, output=str(f))
+    active = await _add_title(job_id, 1, TitleState.RIPPING)
+
+    cfg = AppConfig()
+    cfg.timeout_ripping_seconds = 1
+    # Fresh clock — what the fs monitor maintains while rip output grows.
+    job_manager._last_activity[job_id] = time.monotonic()
+
+    job = await _job(job_id)
+    await job_manager._watchdog_check_job(job, cfg, time.monotonic())
+
+    assert (await _title(parked)).state == TitleState.QUEUED
+    assert (await _title(active)).state == TitleState.RIPPING
+    assert (await _job(job_id)).state == JobState.RIPPING
+
+
+@pytest.mark.asyncio
+async def test_stale_rip_force_advance_spares_parked_queued_titles(tmp_path):
+    """(B4a residual) A genuinely stale RIPPING job with identity pending IS
+    still force-advanced (rip stall detection stays live), but its parked
+    QUEUED titles survive untouched — reconcile_and_advance excludes QUEUED, so
+    the review flow / answer endpoints keep owning them."""
+    f = tmp_path / "disc_t00.mkv"
+    f.write_bytes(b"x")
+    job_id = await _make_job(
+        tmp_path, state=JobState.RIPPING, identity_prompt_json=_IDENTITY_PROMPT
+    )
+    parked = await _add_title(job_id, 0, TitleState.QUEUED, output=str(f))
+    stuck = await _add_title(job_id, 1, TitleState.RIPPING)  # no file → FAILED
+
+    cfg = AppConfig()
+    cfg.timeout_ripping_seconds = 1
+    job_manager._last_activity[job_id] = time.monotonic() - 9999
+
+    job = await _job(job_id)
+    await job_manager._watchdog_check_job(job, cfg, time.monotonic())
+
+    assert (await _title(parked)).state == TitleState.QUEUED
+    assert (await _title(stuck)).state == TitleState.FAILED
+    # The prompt is untouched — answering it later still releases the parked
+    # title via dispatch_pending_matches.
+    assert (await _job(job_id)).identity_prompt_json == _IDENTITY_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_watchdog_review_needed_is_resting_state(tmp_path):
+    """(B4b) REVIEW_NEEDED has no phase timeout: even with a stale clock the
+    watchdog never advances a job parked in review — the post-rip identity
+    convergence lands jobs in a genuine resting state."""
+    f = tmp_path / "disc_t00.mkv"
+    f.write_bytes(b"x")
+    job_id = await _make_job(tmp_path, state=JobState.REVIEW_NEEDED)
+    parked = await _add_title(job_id, 0, TitleState.QUEUED, output=str(f))
+
+    cfg = AppConfig()
+    job_manager._last_activity[job_id] = time.monotonic() - 9999
+
+    job = await _job(job_id)
+    await job_manager._watchdog_check_job(job, cfg, time.monotonic())
+
+    assert (await _job(job_id)).state == JobState.REVIEW_NEEDED
+    assert (await _title(parked)).state == TitleState.QUEUED
+
+
 # --- watchdog config helper ------------------------------------------------
 
 
@@ -530,6 +678,31 @@ async def test_cleanup_stale_jobs_still_fails_matching(tmp_path):
     await job_manager._cleanup_stale_jobs()
 
     assert (await _job(job_id)).state == JobState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_jobs_clears_identity_prompt(tmp_path):
+    """An active job with an identity prompt is FAILED on restart and its
+    identity_prompt_json is cleared.
+
+    The REST contract says identity_prompt_json is cleared when the answer
+    becomes moot. A FAILED row is terminal — the prompt is meaningless and must
+    not be served to the frontend.
+    """
+    job_id = await _make_job(
+        tmp_path,
+        content_type=ContentType.TV,
+        state=JobState.RIPPING,
+        identity_prompt_json=_IDENTITY_PROMPT,
+    )
+    # Confirm the prompt is set before cleanup.
+    assert (await _job(job_id)).identity_prompt_json == _IDENTITY_PROMPT
+
+    await job_manager._cleanup_stale_jobs()
+
+    j = await _job(job_id)
+    assert j.state == JobState.FAILED
+    assert j.identity_prompt_json is None
 
 
 @pytest.mark.asyncio
@@ -572,3 +745,88 @@ async def test_recover_organizing_fails_movie(tmp_path, monkeypatch):
 
     assert (await _job(job_id)).state == JobState.FAILED
     assert called == []  # finalize never invoked for a movie
+
+
+# --- watchdog B5: RIPPING + dead rip task clock-refresh branch ---------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ripping_dead_task_no_prompt_queued_refreshes_clock(tmp_path):
+    """(B5a) RIPPING + dead rip task + no identity prompt + QUEUED titles → clock
+    refreshed, no reconcile/force-advance.
+
+    After a stale-rip reconcile cancels the rip task, mid-rip answer dispatches
+    matching while the job is still RIPPING. The watchdog must not force those
+    in-flight QUEUED tracks to review; the queue-drain clock-refresh absorbs them.
+    """
+    f = tmp_path / "disc_t00.mkv"
+    f.write_bytes(b"x")
+    job_id = await _make_job(tmp_path, content_type=ContentType.TV, state=JobState.RIPPING)
+    t0 = await _add_title(job_id, 0, TitleState.QUEUED, output=str(f))
+
+    cfg = AppConfig()
+    cfg.timeout_ripping_seconds = 1
+    # Stale clock — but the rip task is already dead (not in _active_jobs).
+    job_manager._last_activity[job_id] = time.monotonic() - 9999
+
+    job = await _job(job_id)
+    await job_manager._watchdog_check_job(job, cfg, time.monotonic())
+
+    # Title untouched — watchdog refreshed the clock and returned.
+    assert (await _title(t0)).state == TitleState.QUEUED
+    assert (await _job(job_id)).state == JobState.RIPPING
+    assert job_manager._last_activity[job_id] > time.monotonic() - 5
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ripping_dead_task_blocking_prompt_does_not_refresh(tmp_path):
+    """(B5b) RIPPING + dead rip task + BLOCKING prompt still pending + QUEUED titles
+    → clock NOT refreshed, job not advanced either.
+
+    The accepted B4 residual: with an unanswered identity prompt the QUEUED titles
+    are parked (not progressing), so we preserve the stale clock so reconcile
+    keeps re-firing until the user answers. We do NOT advance here because
+    _identity_pending makes queue_draining False, so the normal stale-timeout path
+    decides what to do (stale clock >= timeout -> reconcile).
+    """
+    f = tmp_path / "disc_t00.mkv"
+    f.write_bytes(b"x")
+    job_id = await _make_job(
+        tmp_path,
+        content_type=ContentType.TV,
+        state=JobState.RIPPING,
+        identity_prompt_json=_IDENTITY_PROMPT,
+    )
+    await _add_title(job_id, 0, TitleState.QUEUED, output=str(f))
+
+    cfg = AppConfig()
+    cfg.timeout_ripping_seconds = 1
+    stale_ts = time.monotonic() - 9999
+    job_manager._last_activity[job_id] = stale_ts
+
+    job = await _job(job_id)
+    # Use a snapshot of now so the stale-timeout check fires.
+    await job_manager._watchdog_check_job(job, cfg, time.monotonic())
+
+    # Clock was NOT refreshed by the queue-drain branch.
+    assert job_manager._last_activity[job_id] == stale_ts
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ripping_dead_task_no_prompt_no_queued_times_out(tmp_path):
+    """(B5c) RIPPING + dead rip task + no identity prompt + ZERO queued/matching
+    titles -> falls through to the stale-timeout path (clock NOT refreshed by the
+    queue-drain branch), and the timeout fires -> reconcile_and_advance.
+    """
+    job_id = await _make_job(tmp_path, content_type=ContentType.TV, state=JobState.RIPPING)
+    stuck = await _add_title(job_id, 0, TitleState.RIPPING)  # no file -> FAILED on advance
+
+    cfg = AppConfig()
+    cfg.timeout_ripping_seconds = 1
+    job_manager._last_activity[job_id] = time.monotonic() - 9999
+
+    job = await _job(job_id)
+    await job_manager._watchdog_check_job(job, cfg, time.monotonic())
+
+    # Stale timeout fired -> reconcile_and_advance ran -> stuck title failed.
+    assert (await _title(stuck)).state == TitleState.FAILED

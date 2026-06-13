@@ -22,7 +22,7 @@ import ContributePage from "../components/ContributePage";
 import { FEATURES } from "../config/constants";
 import { ROUTES, reviewPath } from "../config/routes";
 import { buildNavItems } from "./navigation";
-import { classifyPromptJob, pruneDismissedIds, selectPromptJobs, shouldAutoOpenPrompt } from "./promptSelection";
+import { PROMPT_CTA_LABELS, classifyPromptJob, pruneDismissedIds, selectPromptJobs, shouldAutoOpenPrompt } from "./promptSelection";
 import type { Job } from "../types";
 import { toast } from "sonner";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -167,10 +167,13 @@ function MainDashboard() {
   useNotifications(jobs);
 
   // Show name prompt modal for unreadable labels or TV shows where TMDB lookup failed,
-  // and the season prompt (#370) when the show is known but the season isn't.
-  // Dismissed prompts (Escape / backdrop click) are remembered so the next jobs
-  // refresh doesn't immediately re-open them — dismissal parks the job in review,
-  // it does NOT cancel it.
+  // the season prompt (#370) when the show is known but the season isn't, and the
+  // re-identify prompt for an ambiguous same-name identity. Walk-away Phase B: these
+  // prompts now also surface on RIPPING jobs (identity_prompt_json) — answering
+  // mid-rip updates metadata while the rip carries on. Dismissed prompts (Escape /
+  // backdrop click) are remembered so the next jobs refresh doesn't immediately
+  // re-open them — dismissal leaves the job alone (parked review job stays parked,
+  // ripping job keeps ripping), it does NOT cancel it.
   //
   // P13: the modal only AUTO-opens when the candidate is the only active job, so
   // it never steals focus from a disc the user is watching rip/match. Otherwise
@@ -178,18 +181,55 @@ function MainDashboard() {
   // below). We never auto-CLOSE a modal here just because another job became
   // active — only a vanished candidate (resolved / dismissed / removed) closes
   // it — so a manually opened prompt is never yanked shut by a jobs refresh.
+  //
+  // B7 race suppression: dismissal is per-PROMPT, not per-job. Submit/cancel
+  // suppress THIS question only. The effect below re-arms for a DIFFERENT
+  // non-empty identity_prompt_json on the same job (e.g. name prompt answered,
+  // then a reidentify prompt appears later).
   const dismissedPromptIdsRef = useRef<Set<number>>(new Set());
+  // Tracks the last-seen non-empty identity_prompt_json per job id so we can
+  // detect when a new/different prompt arrives and un-dismiss that job.
+  const lastSeenPromptJsonRef = useRef<Map<number, string>>(new Map());
   useEffect(() => {
     pruneDismissedIds(dismissedPromptIdsRef.current, jobs);
-    const { namePromptJob: needsName, seasonPromptJob: needsSeason } = selectPromptJobs(
-      jobs,
-      dismissedPromptIdsRef.current,
-    );
+
+    // Content-change un-dismiss: if a job now carries a DIFFERENT non-empty
+    // identity_prompt_json than the last time we saw it, the backend has issued
+    // a new question — the old dismissal no longer applies. Remove the id from
+    // the dismissed set so the new prompt can auto-open if eligible.
+    // When the prompt clears ("" / null), just update the tracking map without
+    // un-dismissing — the job resolved, it wasn't re-prompted.
+    for (const job of jobs) {
+      const current = job.identity_prompt_json || '';
+      const last = lastSeenPromptJsonRef.current.get(job.id) ?? '';
+      if (current !== last) {
+        if (current) {
+          // A new/different non-empty prompt arrived — un-dismiss so it can fire.
+          dismissedPromptIdsRef.current.delete(job.id);
+        }
+        lastSeenPromptJsonRef.current.set(job.id, current);
+      }
+    }
+
+    const {
+      namePromptJob: needsName,
+      seasonPromptJob: needsSeason,
+      reidentifyPromptJob: needsReidentify,
+    } = selectPromptJobs(jobs, dismissedPromptIdsRef.current);
     if (!needsName) setNamePromptJob(null);
     else if (shouldAutoOpenPrompt(needsName, jobs)) setNamePromptJob(needsName);
 
     if (!needsSeason) setSeasonPromptJob(null);
     else if (shouldAutoOpenPrompt(needsSeason, jobs)) setSeasonPromptJob(needsSeason);
+
+    // Reidentify prompts (walk-away Phase B: ambiguous same-name identity,
+    // ripping carries on) share modal state with the manual "Wrong title?"
+    // flow, which opens for jobs that carry NO identity prompt — so unlike
+    // name/season we never auto-CLOSE here: a vanished prompt must not yank a
+    // manually opened modal shut. Auto-open only; submit/cancel close it.
+    if (needsReidentify && shouldAutoOpenPrompt(needsReidentify, jobs)) {
+      setReIdentifyTarget(needsReidentify);
+    }
   }, [jobs]);
 
   // Side-rail collapse breakpoint: below ~1100px (snapped half-monitor windows)
@@ -205,12 +245,19 @@ function MainDashboard() {
   });
 
   // Open a disc's identify prompt on demand (the card / compact-row CTA). Routes
-  // to the name or season modal by the same matcher the auto-open path uses, so
-  // the manual and automatic openings can never disagree.
+  // to the name / season / re-identify modal by the same matcher the auto-open
+  // path uses, so the manual and automatic openings can never disagree.
   const openIdentifyPrompt = (id: string) => {
     const job = jobs.find((j) => String(j.id) === id);
     if (!job) return;
-    if (classifyPromptJob(job) === 'season') setSeasonPromptJob(job);
+    // A CTA click is an explicit "show me the prompt again" — forget any
+    // earlier dismissal. Without this, the effect above (which closes modals
+    // whose selected candidate vanished) would re-close the reopened modal on
+    // the next jobs refresh — sub-second while a rip is streaming progress.
+    dismissedPromptIdsRef.current.delete(job.id);
+    const kind = classifyPromptJob(job);
+    if (kind === 'reidentify') setReIdentifyTarget(job);
+    else if (kind === 'season') setSeasonPromptJob(job);
     else setNamePromptJob(job);
   };
 
@@ -671,11 +718,12 @@ function MainDashboard() {
                     const job = jobs.find(j => String(j.id) === disc.id);
                     if (job) setReIdentifyTarget(job);
                   } : undefined}
-                  // P13: review jobs needing a name/season get a card CTA that opens
+                  // P13 + walk-away Phase B: jobs needing a name/season/identity —
+                  // parked in review OR still ripping — get a card CTA that opens
                   // the prompt on demand (it no longer auto-opens over the dashboard
                   // while other jobs are active). promptKind comes from the adapter.
                   onIdentify={disc.promptKind ? () => openIdentifyPrompt(disc.id) : undefined}
-                  identifyLabel={disc.promptKind === 'season' ? 'Select season' : 'Name this disc'}
+                  identifyLabel={disc.promptKind ? PROMPT_CTA_LABELS[disc.promptKind] : undefined}
                   onReportBug={() => setBugReportJobId(Number(disc.id))}
                   onOpenSettings={() => openSettings("tmdb")}
                 />
@@ -697,6 +745,11 @@ function MainDashboard() {
             job={namePromptJob}
             initialTitle={namePromptJob.detected_title ?? ''}
             onSubmit={(name, contentType, season) => {
+              // B7: dismiss before closing so a progress tick inside the POST
+              // round-trip window can't re-select this job and re-open the modal.
+              // Dismissal is per-prompt — content-change un-dismiss (above) will
+              // re-arm the job if the backend issues a different prompt later.
+              dismissedPromptIdsRef.current.add(namePromptJob.id);
               setJobName(namePromptJob.id, name, contentType, season);
               setNamePromptJob(null);
             }}
@@ -718,6 +771,8 @@ function MainDashboard() {
           <SeasonPromptModal
             job={seasonPromptJob}
             onSubmit={(season) => {
+              // B7: dismiss before closing to block re-open during POST round-trip.
+              dismissedPromptIdsRef.current.add(seasonPromptJob.id);
               setJobName(
                 seasonPromptJob.id,
                 seasonPromptJob.detected_title ?? seasonPromptJob.volume_label,
@@ -744,10 +799,23 @@ function MainDashboard() {
           <ReIdentifyModal
             job={reIdentifyTarget}
             onSubmit={(title, contentType, season, tmdbId) => {
+              // B7: dismiss before closing. The reidentify modal never auto-closes
+              // (see note below), so without this a stale identity_prompt_json on
+              // the next progress tick would re-open the modal the user just
+              // answered and double-POST on a confused re-submit.
+              dismissedPromptIdsRef.current.add(reIdentifyTarget.id);
               reIdentifyJob(reIdentifyTarget.id, title, contentType, season, tmdbId);
               setReIdentifyTarget(null);
             }}
-            onCancel={() => setReIdentifyTarget(null)}
+            onCancel={() => {
+              // Remember the dismissal like the name/season prompts do —
+              // without it, an auto-opened reidentify prompt (walk-away Phase
+              // B) would re-open on the next jobs refresh. Harmless for the
+              // manual "Wrong title?" flow (the id is only consulted by
+              // prompt selection, and the CTA un-dismisses on click).
+              dismissedPromptIdsRef.current.add(reIdentifyTarget.id);
+              setReIdentifyTarget(null);
+            }}
           />
         )}
       </AnimatePresence>

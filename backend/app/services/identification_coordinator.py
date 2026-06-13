@@ -29,15 +29,62 @@ from app.database import async_session
 from app.models import DiscJob, JobState
 from app.models.disc_job import ContentType, DiscTitle, TitleState
 from app.services.event_broadcaster import EventBroadcaster
+from app.services.identity_prompts import (
+    IdentityResumeResult,
+    ReIdentifyResumeResult,
+    ResumeAction,
+    mid_rip_resume_action,
+)
 from app.services.job_state_machine import JobStateMachine
 from app.services.ripping_helpers import build_title_list
 
 logger = logging.getLogger(__name__)
 
 
+# Review reason for a job with no usable title. Shared between
+# identify_from_staging's no-title park here and job_manager's fallback for a
+# malformed blocking identity prompt (walk-away Phase B) — ONE literal, so the
+# frontend routing (review page, no auto-modal: it matches no classifyPromptJob
+# substring) can't drift between the two sites. job_manager imports it; the
+# import goes this direction because job_manager already imports this module.
+NO_TITLE_REVIEW_REASON = "Could not determine title. Please enter the title to continue."
+
+# Permissive title-selection floor for identity-unknown discs (walk-away B2):
+# anything >= 15 minutes could plausibly be an episode or a feature.
+PERMISSIVE_MIN_DURATION_SECONDS = 900
+
 # Digit-boundary (not \b) so underscores/parens count as separators:
 # FRASIER_2023 and FRASIER (2023) match; a longer number like 20231 does not.
 _YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+
+
+def apply_permissive_title_selection(titles: list[DiscTitle]) -> None:
+    """Select rip-worthy titles for a disc whose identity/type is unknown (B2).
+
+    With no confirmed content type, neither the TV nor the movie selection
+    heuristics apply at rip time. Rip permissively: every title that could
+    plausibly be an episode or a feature (>= 15 min); when nothing clears the
+    bar, the single longest title, so the disc always produces something to
+    identify post-rip. No-op on an empty list (identification already fails a
+    disc with no titles before selection).
+
+    Only PENDING, non-extra titles are eligible. Titles finalized before rip
+    (e.g. Play-All concat rows set to COMPLETED+is_extra by the TV branch) must
+    not be re-selected — doing so wastes rip time on a multi-hour concat and
+    adds an output_filename to a row that was intentionally finalized. When no
+    eligible titles remain (all finalized), the helper is a no-op.
+    """
+    if not titles:
+        return
+    eligible = [t for t in titles if t.state == TitleState.PENDING and not t.is_extra]
+    if not eligible:
+        return
+    keep = [t for t in eligible if (t.duration_seconds or 0) >= PERMISSIVE_MIN_DURATION_SECONDS]
+    if not keep:
+        keep = [max(eligible, key=lambda t: t.duration_seconds or 0)]
+    keep_ids = {id(t) for t in keep}
+    for t in eligible:
+        t.is_selected = id(t) in keep_ids
 
 
 def _label_has_year(*texts: str | None) -> bool:
@@ -163,7 +210,14 @@ class IdentificationCoordinator:
         self._finalize_disc_job = finalize_disc_job
 
     async def identify_disc(self, job_id: int) -> None:
-        """Identify the disc contents using MakeMKV and the Analyst."""
+        """Identify the disc contents using MakeMKV and the Analyst.
+
+        Walk-away B2 path map: the four former pre-rip parks (A unreadable
+        label, B TV-without-TMDB, C same-name collision, D unknown season) now
+        ship to RIPPING with an ``identity_prompt_json`` CTA — see
+        tests/unit/test_identify_rip_first_gates.py's module docstring for the
+        gate-by-gate table and where each seam is pinned.
+        """
         async with async_session() as session:
             job = await session.get(DiscJob, job_id)
             if not job:
@@ -320,13 +374,13 @@ class IdentificationCoordinator:
                             f"extras={extra_indices}"
                         )
 
-                # Broadcast titles discovered with full metadata
+                # Broadcast titles discovered with full metadata (db_titles is
+                # also reused by gate A's permissive selection just below).
                 titles_result = await session.execute(
                     select(DiscTitle).where(DiscTitle.job_id == job_id)
                 )
-                title_list = build_title_list(
-                    titles_result.scalars().all(), include_video_resolution=True
-                )
+                db_titles = list(titles_result.scalars().all())
+                title_list = build_title_list(db_titles, include_video_resolution=True)
                 await ws_manager.broadcast_titles_discovered(
                     job_id,
                     title_list,
@@ -335,25 +389,24 @@ class IdentificationCoordinator:
                     detected_season=job.detected_season,
                 )
 
-                # If no title could be determined, ask user
+                # Gate A (walk-away B2): no title could be determined — rip
+                # first with a non-blocking name prompt instead of parking.
+                # Content type is unknown, so neither selection heuristic
+                # applies: pick titles permissively before ripping. Ripped
+                # titles park QUEUED under the blocking prompt (B3) and the
+                # job converges to pooled review at rip end if unanswered (B4).
                 if not job.detected_title:
-                    await self._state_machine.transition_to_review(
-                        job,
-                        session,
-                        reason="Disc label unreadable. Please enter the title to continue.",
-                        broadcast=False,
-                    )
-                    await ws_manager.broadcast_job_update(
-                        job_id,
-                        JobState.REVIEW_NEEDED.value,
-                        content_type=(job.content_type.value if job.content_type else None),
-                        total_titles=job.total_titles,
-                        review_reason="Disc label unreadable. Please enter the title to continue.",
-                        tmdb_degraded_reason=job.tmdb_degraded_reason or "",
-                    )
+                    apply_permissive_title_selection(db_titles)
                     logger.info(
                         f"Job {job_id}: no title detected (volume label: '{job.volume_label}'), "
-                        f"waiting for user to supply name"
+                        f"ripping first and prompting for a name"
+                    )
+                    await self._rip_first_with_prompt(
+                        job,
+                        session,
+                        job_id,
+                        kind="name",
+                        reason="Disc label unreadable. Please enter the title to continue.",
                     )
                     return
 
@@ -385,12 +438,15 @@ class IdentificationCoordinator:
                 # words-merged guard below.
                 _collision = _amb or _noyear
 
-                # TV show detected but TMDB lookup failed — name cannot be trusted for episode
-                # matching. Block ripping until the user confirms the correct show name.
-                # (Disc-name fallback already ran in _run_classification; if we reach here,
-                # neither the volume label nor the DINFO name resolved on TMDB.)
-                # Exclude collision jobs: they carry a candidate-naming review_reason that
-                # the needs_review branch below will surface.
+                # Gate B (walk-away B2): TV show detected but TMDB lookup failed —
+                # the name cannot be trusted for episode matching, so rip first with
+                # a non-blocking name prompt instead of parking. Subtitle prefetch is
+                # skipped (returning before the prefetch block below): with no
+                # tmdb_id, a name-keyed download would fetch the wrong show.
+                # (Disc-name fallback already ran in _run_classification; if we reach
+                # here, neither the volume label nor the DINFO name resolved on TMDB.)
+                # Exclude collision jobs: they carry a candidate-naming reason that
+                # the needs_review branch below converts (gate C).
                 if (
                     job.content_type == ContentType.TV
                     and not job.tmdb_id
@@ -407,25 +463,13 @@ class IdentificationCoordinator:
                     # keys on the "merged without separators" substring above.
                     if job.tmdb_degraded_reason:
                         reason = f"{reason} Note: {job.tmdb_degraded_reason}"
-                    await self._state_machine.transition_to_review(
-                        job,
-                        session,
-                        reason=reason,
-                        broadcast=False,
-                    )
-                    await ws_manager.broadcast_job_update(
-                        job_id,
-                        JobState.REVIEW_NEEDED.value,
-                        content_type=job.content_type.value,
-                        detected_title=job.detected_title,
-                        detected_season=job.detected_season,
-                        total_titles=job.total_titles,
-                        review_reason=reason,
-                        tmdb_degraded_reason=job.tmdb_degraded_reason or "",
-                    )
                     logger.info(
                         f"Job {job_id}: TMDB lookup failed for '{job.detected_title}' "
-                        f"(volume label: '{job.volume_label}') — prompting user to supply correct show name"
+                        f"(volume label: '{job.volume_label}') — ripping first and "
+                        f"prompting for the correct show name"
+                    )
+                    await self._rip_first_with_prompt(
+                        job, session, job_id, kind="name", reason=reason
                     )
                     return
 
@@ -434,9 +478,13 @@ class IdentificationCoordinator:
                 # Downloading by the tentative name would fetch the wrong show's subtitles
                 # before the user disambiguates.
                 if job.content_type == ContentType.TV and job.detected_title and not _collision:
+                    # Gate D (walk-away B2): an unknown season auto-pins
+                    # single-season shows, otherwise sets a non-blocking
+                    # kind="season" prompt and continues — detected_season
+                    # stays None, so the prefetch below takes the all-seasons
+                    # path and matching searches across every season.
                     if job.detected_season is None:
-                        if await self._gate_unknown_season_disc(job, session, job_id):
-                            return
+                        await self._gate_unknown_season_disc(job, session, job_id)
                     await self._start_tv_subtitle_prefetch(job)
 
                 if analysis.needs_review:
@@ -476,6 +524,29 @@ class IdentificationCoordinator:
                         await self._run_ripping(job_id)
                         return
 
+                    # Gate C (walk-away B2): same-name collision (ambiguous
+                    # identity / no-year twin) — identity is uncertain but the
+                    # twins are persisted (candidates_json, set above) for the
+                    # ReIdentifyModal quick-pick, so rip first with a
+                    # reidentify prompt instead of parking. Prefetch was
+                    # already skipped for collisions (downloading by the
+                    # tentative name would fetch the wrong show's subtitles).
+                    if _collision:
+                        await self._rip_first_with_prompt(
+                            job,
+                            session,
+                            job_id,
+                            kind="reidentify",
+                            reason=analysis.review_reason,
+                        )
+                        return
+
+                    # Every other review reason still parks BEFORE ripping
+                    # (e.g. TMDB/heuristic content-type conflicts). A blocking
+                    # review supersedes the season shortcut CTA — clear it so
+                    # an identify-time REVIEW_NEEDED job never carries a
+                    # prompt (the broadcast below clears it with "").
+                    job.identity_prompt_json = None
                     await self._state_machine.transition_to_review(
                         job,
                         session,
@@ -489,8 +560,10 @@ class IdentificationCoordinator:
 
                 # Both review and high-confidence paths broadcast the same job update.
                 # review_reason is None for the high-confidence path (omitted by the
-                # broadcaster) and carries the candidate-naming reason for review jobs —
-                # the ReIdentifyModal needs it to show why the disc needs disambiguation.
+                # broadcaster) and carries the review reason for parked jobs.
+                # identity_prompt_json rides along so a gate-D season prompt reaches
+                # the dashboard with the RIPPING update ("" clears on the frontend
+                # merge when no prompt is set).
                 await ws_manager.broadcast_job_update(
                     job_id,
                     job.state.value,
@@ -499,6 +572,7 @@ class IdentificationCoordinator:
                     detected_season=job.detected_season,
                     total_titles=job.total_titles,
                     review_reason=analysis.review_reason,
+                    identity_prompt_json=job.identity_prompt_json or "",
                     tmdb_degraded_reason=job.tmdb_degraded_reason or "",
                 )
 
@@ -516,45 +590,71 @@ class IdentificationCoordinator:
                 logger.exception(f"Error identifying disc for job {job_id}")
                 await self._state_machine.transition_to_failed(job, session, str(e))
 
-    async def _gate_unknown_season_disc(self, job, session, job_id: int) -> bool:
-        """Resolve the unknown-season fate of a TV disc (#370).
+    async def _gate_unknown_season_disc(self, job, session, job_id: int) -> None:
+        """Resolve the unknown-season fate of a TV disc (#370, reworked for B2).
 
         Single-season show → auto-pin S1 and continue. Multi-season (or
-        unresolvable) → park in REVIEW_NEEDED with the season prompt and
-        return True so the caller stops before ripping.
+        unresolvable) → set a non-blocking ``kind="season"`` prompt as an
+        optional shortcut and continue: the show identity IS known, so the
+        caller's all-seasons prefetch covers matching across every season
+        while the user may pin a season at any time. Pre-B2 this gate parked
+        the job in REVIEW_NEEDED before ripping; it no longer parks.
         """
-        # Disc label carried no season (box-set labels like
-        # "Eureka D3"). A single-season show needs no prompt;
-        # otherwise park the job for a season pick BEFORE
-        # ripping — downstream, an unknown season used to skip
-        # subtitle download entirely and dead-end every title
-        # in review (#370). Resumes via set_name_and_resume.
+        # Disc label carried no season (box-set labels like "Eureka D3"). A
+        # single-season show needs no prompt; downstream, an unknown season
+        # used to skip subtitle download entirely and dead-end every title in
+        # review (#370) — the all-seasons prefetch now covers it.
         seasons = await self._resolve_all_season_numbers(job.detected_title, tmdb_id=job.tmdb_id)
         if len(seasons) == 1:
             job.detected_season = seasons[0]
             await session.commit()
-            return False
+            return
         # "select a season" is a frontend contract: the dashboard keys the
         # SeasonPromptModal on that exact substring — keep it in ONE literal.
         reason = (
             f"Identified as '{job.detected_title}' but the season could not "
             f"be detected from the disc label — select a season to continue."
         )
-        await self._state_machine.transition_to_review(job, session, reason=reason, broadcast=False)
+        job.identity_prompt_json = json.dumps({"kind": "season", "reason": reason})
+        await session.commit()
+        logger.info(
+            f"Job {job_id}: season unknown for '{job.detected_title}' — non-blocking "
+            f"season prompt set, matching will search across all seasons"
+        )
+
+    async def _rip_first_with_prompt(
+        self, job, session, job_id: int, *, kind: str, reason: str
+    ) -> None:
+        """Ship a job to RIPPING carrying an identity prompt instead of parking (B2).
+
+        Replaces a pre-rip REVIEW_NEEDED park: ``reason`` is recorded VERBATIM
+        — the texts are frontend contracts (modal routing keys on substrings
+        like "label unreadable" / "merged without separators") and B4's
+        rip-end convergence replays them as ``review_reason``, reproducing
+        today's review UX for an unanswered prompt. The transition mirrors the
+        high-confidence auto-rip path (direct RIPPING + commit + broadcast +
+        ``_run_ripping``). Blocking kinds (``name``/``reidentify``) park
+        ripped titles in QUEUED via the B3 matching gate; ``season`` is a
+        shortcut CTA and titles dispatch normally.
+        """
+        job.identity_prompt_json = json.dumps({"kind": kind, "reason": reason})
+        job.state = JobState.RIPPING
+        await session.commit()
         await ws_manager.broadcast_job_update(
             job_id,
-            JobState.REVIEW_NEEDED.value,
-            content_type=job.content_type.value,
+            job.state.value,
+            content_type=(job.content_type.value if job.content_type else None),
             detected_title=job.detected_title,
-            detected_season=None,
+            detected_season=job.detected_season,
             total_titles=job.total_titles,
-            review_reason=reason,
+            identity_prompt_json=job.identity_prompt_json,
             tmdb_degraded_reason=job.tmdb_degraded_reason or "",
         )
         logger.info(
-            f"Job {job_id}: season unknown for '{job.detected_title}', prompting user for season"
+            f"Job {job_id}: rip-first with an open identity question (kind={kind}) — "
+            f"auto-starting rip"
         )
-        return True
+        await self._run_ripping(job_id)
 
     async def _resolve_all_season_numbers(
         self, title: str, tmdb_id: int | None = None
@@ -798,7 +898,7 @@ class IdentificationCoordinator:
                     await self._state_machine.transition_to_review(
                         job,
                         session,
-                        reason="Could not determine title. Please enter the title to continue.",
+                        reason=NO_TITLE_REVIEW_REASON,
                         broadcast=False,
                     )
                     await ws_manager.broadcast_job_update(
@@ -806,7 +906,7 @@ class IdentificationCoordinator:
                         JobState.REVIEW_NEEDED.value,
                         content_type=(job.content_type.value if job.content_type else None),
                         total_titles=job.total_titles,
-                        review_reason="Could not determine title. Please enter the title to continue.",
+                        review_reason=NO_TITLE_REVIEW_REASON,
                         tmdb_degraded_reason=job.tmdb_degraded_reason or "",
                     )
                     return
@@ -987,15 +1087,43 @@ class IdentificationCoordinator:
         name: str,
         content_type_str: str,
         season: int | None = None,
-    ) -> None:
-        """Set a user-provided name for an unlabeled disc and resume ripping."""
+    ) -> IdentityResumeResult:
+        """Set a user-provided name for a disc and resume the pipeline.
+
+        Accepts a job in REVIEW_NEEDED (a pre-rip park, the B4 post-rip
+        convergence, or a stall review) or RIPPING (a mid-rip answer to the
+        non-blocking identity CTA — walk-away B5).
+
+        Returns the resume contract consumed by ``JobManager``:
+        ``{"job_id": ..., "resume_action": ...}`` where ``resume_action`` is
+
+        - ``"start_rip"`` — pre-rip review resume → spawn ``_run_ripping``.
+          The ONLY action that may start a rip; every other action must not
+          (the double-rip hazard: mid-rip the rip is already running, post-rip
+          the disc is already ripped and ejected).
+        - ``"dispatch_matches"`` — TV answer with files ripping/ripped:
+          release identity-parked QUEUED titles into episode matching.
+        - ``"release_movie_titles"`` — non-TV mid-rip answer: flip parked
+          QUEUED titles to MATCHED; the running rip's movie tail finishes.
+        - ``"resolve_movie"`` — non-TV post-rip answer: route to the movie
+          feature-resolution path (never episode matching).
+        """
         async with async_session() as session:
             job = await session.get(DiscJob, job_id)
             if not job:
                 raise ValueError(f"Job {job_id} not found")
 
-            if job.state != JobState.REVIEW_NEEDED:
+            if job.state not in (JobState.REVIEW_NEEDED, JobState.RIPPING):
                 raise ValueError(f"Cannot set name on job in state: {job.state}")
+
+            mid_rip = job.state == JobState.RIPPING
+            # Post-rip detection (mirrors re_identify): staged .mkv files mean
+            # the disc already ripped (and was ejected at rip end) — resuming
+            # must route to matching/movie resolution, never a second rip.
+            has_ripped = False
+            if not mid_rip and job.staging_path:
+                staging = Path(job.staging_path)
+                has_ripped = staging.exists() and any(staging.glob("*.mkv"))
 
             job.detected_title = name
             job.content_type = ContentType(content_type_str)
@@ -1004,7 +1132,7 @@ class IdentificationCoordinator:
             # Resolve the TMDB id for the user-provided name now (same tmdb-keyed-cache
             # requirement as imports — #288). Confident single match sets the id;
             # ambiguous same-name twins are left null. Committed atomically with the
-            # RIPPING transition below (the resolver does not commit).
+            # state handling below (the resolver does not commit).
             await self._resolve_missing_tmdb_id(job)
             # The season prompt and the unreadable-label prompt both resume
             # through here — kick the reference-subtitle prefetch now that the
@@ -1013,24 +1141,59 @@ class IdentificationCoordinator:
             # seasons") falls through to the all-seasons prefetch.
             if job.content_type == ContentType.TV and job.detected_title:
                 await self._start_tv_subtitle_prefetch(job)
-            job.review_reason = None
-            job.state = JobState.RIPPING
+            # The question is answered — retire the walk-away CTA (B5); the ""
+            # in the broadcast below clears it on the frontend merge.
+            job.identity_prompt_json = None
+            is_tv = job.content_type == ContentType.TV
+
+            if mid_rip:
+                # Mid-rip answer: metadata only — NO state change and NO new
+                # rip task (the rip is already running). review_reason is left
+                # untouched: if the B4 convergence committed REVIEW_NEEDED
+                # between our state read and this commit (possible — the
+                # awaits above yield the event loop), the job parks in review
+                # with its reason intact and the user answers again there
+                # (review-resume); matching dispatched below still proceeds.
+                target_state = JobState.RIPPING
+                resume_action: ResumeAction = mid_rip_resume_action(is_tv)
+            elif has_ripped:
+                job.review_reason = None
+                if is_tv:
+                    # Post-rip answer (B4 convergence / stall review): files
+                    # exist and the disc is gone — go to MATCHING, never re-rip.
+                    job.state = JobState.MATCHING
+                    target_state = JobState.MATCHING
+                    resume_action = "dispatch_matches"
+                else:
+                    # Movie post-rip: the feature-resolution task owns the
+                    # state from here (ORGANIZING, or back to review for
+                    # competing cuts) — leave it for one coherent broadcast.
+                    target_state = job.state
+                    resume_action = "resolve_movie"
+            else:
+                job.review_reason = None
+                job.state = JobState.RIPPING
+                target_state = JobState.RIPPING
+                resume_action = "start_rip"
+
             job.updated_at = datetime.now(UTC)
             await session.commit()
 
             await ws_manager.broadcast_job_update(
                 job_id,
-                JobState.RIPPING.value,
+                target_state.value,
                 content_type=job.content_type.value,
                 detected_title=job.detected_title,
                 detected_season=job.detected_season,
+                identity_prompt_json="",
             )
 
             logger.info(
-                f"Job {job_id}: user set name to '{name}' ({content_type_str}), resuming rip"
+                f"Job {job_id}: user set name to '{name}' ({content_type_str}), "
+                f"resume action: {resume_action}"
             )
 
-        return job_id  # Signal to JobManager to create the ripping task
+        return {"job_id": job_id, "resume_action": resume_action}
 
     async def re_identify(
         self,
@@ -1039,20 +1202,27 @@ class IdentificationCoordinator:
         content_type_str: str,
         season: int | None = None,
         tmdb_id: int | None = None,
-    ) -> dict:
+    ) -> ReIdentifyResumeResult:
         """Re-identify a job with user-corrected metadata.
 
+        Accepts a job in REVIEW_NEEDED (today's review answer) or RIPPING (a
+        mid-rip answer to the walk-away identity CTA — B5).
+
         Returns:
-            dict with 'job_id' and 'has_ripped' (bool) to signal
-            whether JobManager should start ripping or matching.
+            dict with 'job_id', 'has_ripped' (bool), and 'resume_action' — the
+            same contract as ``set_name_and_resume`` (see its docstring), plus
+            ``"rerun_matching"`` for the TV post-rip review answer (full
+            re-match with corrected metadata, today's behavior).
         """
         async with async_session() as session:
             job = await session.get(DiscJob, job_id)
             if not job:
                 raise ValueError(f"Job {job_id} not found")
 
-            if job.state != JobState.REVIEW_NEEDED:
+            if job.state not in (JobState.REVIEW_NEEDED, JobState.RIPPING):
                 raise ValueError(f"Cannot re-identify job in state: {job.state.value}")
+
+            mid_rip = job.state == JobState.RIPPING
 
             # Check if files already exist in staging (post-rip)
             has_ripped = False
@@ -1065,7 +1235,11 @@ class IdentificationCoordinator:
             job.content_type = ContentType(content_type_str)
             if season is not None:
                 job.detected_season = season
-            job.review_reason = None
+            if not mid_rip:
+                # Mid-rip there is no review_reason to clear, and leaving it
+                # untouched keeps a convergence-race park readable (see the
+                # mid_rip comment in set_name_and_resume).
+                job.review_reason = None
             # Clear same-name candidates recorded for the PREVIOUS identification
             # attempt: the user has now made an explicit choice, so they're stale.
             # Leaving them would let the ReIdentifyModal quick-pick and the
@@ -1124,14 +1298,39 @@ class IdentificationCoordinator:
                 _year = _old_year
             job.tmdb_year = _year
 
-            if has_ripped:
-                # Post-rip: go to MATCHING to re-run episode matching
-                job.state = JobState.MATCHING
-                target_state = JobState.MATCHING
+            # The question is answered — retire the walk-away CTA (B5); the ""
+            # in the broadcast below clears it on the frontend merge.
+            job.identity_prompt_json = None
+            is_tv = job.content_type == ContentType.TV
+
+            if mid_rip:
+                # Mid-rip answer: metadata only — NO state change and NO new
+                # tasks; the running rip continues and the rip-end re-read
+                # (B4) picks up the corrected identity.
+                target_state = JobState.RIPPING
+                resume_action: ResumeAction = mid_rip_resume_action(is_tv)
+                # The identify-time prefetch was skipped while the identity
+                # question was open (B2 gates B/C) — kick it now. Known season
+                # → that season; unknown → all seasons (cross-season matching).
+                if is_tv and job.detected_title:
+                    await self._start_tv_subtitle_prefetch(job)
+            elif has_ripped:
+                if is_tv:
+                    # Post-rip: go to MATCHING to re-run episode matching
+                    job.state = JobState.MATCHING
+                    target_state = JobState.MATCHING
+                    resume_action = "rerun_matching"
+                else:
+                    # A movie answer with ripped files routes to the movie
+                    # feature-resolution path, never episode MATCHING. The
+                    # resolution task owns the state from here.
+                    target_state = job.state
+                    resume_action = "resolve_movie"
             else:
                 # Pre-rip: go to RIPPING
                 job.state = JobState.RIPPING
                 target_state = JobState.RIPPING
+                resume_action = "start_rip"
 
             job.updated_at = datetime.now(UTC)
             await session.commit()
@@ -1139,9 +1338,12 @@ class IdentificationCoordinator:
             # Restart subtitle download with the corrected title. The original
             # subtitle attempt likely failed against the unresolvable label,
             # leaving subtitle_status="failed" and a stale `_subtitle_ready`
-            # event that would gate matching back into REVIEW.
+            # event that would gate matching back into REVIEW. (Review-resume
+            # only: the mid-rip branch above starts a fresh prefetch instead —
+            # nothing stale exists while the identity question is open.)
             should_restart_subtitles = (
-                job.content_type == ContentType.TV
+                not mid_rip
+                and job.content_type == ContentType.TV
                 and job.detected_title
                 and job.detected_season is not None
                 and self._restart_subtitle_download is not None
@@ -1159,11 +1361,12 @@ class IdentificationCoordinator:
                 detected_title=job.detected_title,
                 detected_season=job.detected_season,
                 tmdb_degraded_reason=job.tmdb_degraded_reason or "",
+                identity_prompt_json="",
             )
 
             logger.info(
                 f"Job {job_id}: re-identified as '{job.detected_title}' "
-                f"({content_type_str}), transitioning to {target_state.value}"
+                f"({content_type_str}), resume action: {resume_action}"
             )
 
         # Restart outside the session block: restart_subtitle_download opens its
@@ -1171,7 +1374,7 @@ class IdentificationCoordinator:
         if restart_args is not None:
             await self._restart_subtitle_download(*restart_args)
 
-        return {"job_id": job_id, "has_ripped": has_ripped}
+        return {"job_id": job_id, "has_ripped": has_ripped, "resume_action": resume_action}
 
     async def _run_classification(
         self, job, job_id, titles, session, is_staging=False, disc_name: str = ""

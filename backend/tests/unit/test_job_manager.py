@@ -9,6 +9,7 @@ and websocket layer are stubbed.
 import asyncio
 import importlib
 import json
+import logging
 import time
 from unittest.mock import AsyncMock
 
@@ -35,7 +36,12 @@ def _quiet_ws(monkeypatch):
     monkeypatch.setattr(ws_manager, "broadcast_title_update", _noop)
 
 
-async def _seed(content_type=ContentType.TV, staging="/tmp/staging", **title_kwargs):
+async def _seed(
+    content_type=ContentType.TV,
+    staging="/tmp/staging",
+    identity_prompt_json=None,
+    **title_kwargs,
+):
     async with _unit_session_factory() as session:
         job = DiscJob(
             drive_id="E:",
@@ -45,6 +51,7 @@ async def _seed(content_type=ContentType.TV, staging="/tmp/staging", **title_kwa
             detected_title="Some Show",
             detected_season=1,
             staging_path=staging,
+            identity_prompt_json=identity_prompt_json,
         )
         session.add(job)
         await session.commit()
@@ -128,6 +135,218 @@ class TestOnTitleRipped:
 
         t = await _get_title(title.id)
         assert t.state == TitleState.RIPPING  # unchanged
+
+
+_PROMPT = json.dumps({"kind": "name", "reason": "Disc label unreadable"})
+
+
+@pytest.mark.unit
+class TestOnTitleRippedIdentityGate:
+    """Walk-away Phase B: an unanswered identity prompt parks ripped titles in
+    QUEUED with no dispatch (matching with no/uncertain show identity wastes ASR
+    against the wrong — or no — reference corpus). dispatch_pending_matches
+    releases them once the prompt is answered."""
+
+    def _stub_dispatch(self, monkeypatch):
+        discdb = AsyncMock(return_value=False)
+        dispatch = AsyncMock()
+        monkeypatch.setattr(job_manager._matching, "try_discdb_assignment", discdb)
+        monkeypatch.setattr(job_manager._matching, "match_single_file", dispatch)
+        monkeypatch.setattr(job_manager._matching, "on_match_task_done", lambda *a, **k: None)
+        return discdb, dispatch
+
+    async def test_tv_with_prompt_parks_queued_without_dispatch(self, tmp_path, monkeypatch):
+        job, title = await _seed(content_type=ContentType.TV, identity_prompt_json=_PROMPT)
+        discdb, dispatch = self._stub_dispatch(monkeypatch)
+        path = tmp_path / "show_t00.mkv"
+        path.write_text("")
+
+        await job_manager._on_title_ripped(job.id, 1, path, [title])
+        await asyncio.sleep(0)
+
+        t = await _get_title(title.id)
+        assert t.state == TitleState.QUEUED
+        assert t.output_filename == str(path)
+        discdb.assert_not_called()
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize("content_type", [ContentType.UNKNOWN, ContentType.MOVIE])
+    async def test_non_tv_with_prompt_parks_queued_not_matched(
+        self, tmp_path, monkeypatch, content_type
+    ):
+        """An identity-pending job must NOT fall into the non-TV → MATCHED branch:
+        that would mark titles matched with no identity."""
+        job, title = await _seed(content_type=content_type, identity_prompt_json=_PROMPT)
+        discdb, dispatch = self._stub_dispatch(monkeypatch)
+        path = tmp_path / "disc_t00.mkv"
+        path.write_text("")
+
+        await job_manager._on_title_ripped(job.id, 1, path, [title])
+        await asyncio.sleep(0)
+
+        t = await _get_title(title.id)
+        assert t.state == TitleState.QUEUED
+        discdb.assert_not_called()
+        dispatch.assert_not_called()
+
+    async def test_reidentify_prompt_also_parks(self, tmp_path, monkeypatch):
+        """kind=reidentify means no confirmed identity — same park as kind=name."""
+        job, title = await _seed(
+            content_type=ContentType.TV,
+            identity_prompt_json=json.dumps({"kind": "reidentify", "reason": "twins"}),
+        )
+        discdb, dispatch = self._stub_dispatch(monkeypatch)
+        path = tmp_path / "show_t00.mkv"
+        path.write_text("")
+
+        await job_manager._on_title_ripped(job.id, 1, path, [title])
+        await asyncio.sleep(0)
+
+        assert (await _get_title(title.id)).state == TitleState.QUEUED
+        discdb.assert_not_called()
+        dispatch.assert_not_called()
+
+    async def test_season_prompt_dispatches_normally(self, tmp_path, monkeypatch):
+        """kind=season is a shortcut CTA, not a blocking identity question: the
+        ripped title goes QUEUED→dispatch like any TV title (B2 item 1). Parking
+        it would hang the job forever — the season-prompt job reaches MATCHING
+        and _has_pending_match_work refreshes the watchdog clock with nothing
+        ever dispatching."""
+        job, title = await _seed(content_type=ContentType.TV, identity_prompt_json=_SEASON_PROMPT)
+        discdb, dispatch = self._stub_dispatch(monkeypatch)
+        path = tmp_path / "show_t00.mkv"
+        path.write_text("")
+
+        await job_manager._on_title_ripped(job.id, 1, path, [title])
+        await asyncio.sleep(0)
+
+        t = await _get_title(title.id)
+        assert t.state == TitleState.QUEUED  # flip to MATCHING is post-semaphore
+        discdb.assert_awaited_once()
+        dispatch.assert_awaited_once()
+
+
+@pytest.mark.unit
+class TestDispatchPendingMatches:
+    """dispatch_pending_matches releases identity-gated QUEUED titles: dispatch
+    exactly the QUEUED titles whose ripped file exists, idempotently."""
+
+    def _stub_dispatch(self, monkeypatch, discdb_applied=False):
+        discdb = AsyncMock(return_value=discdb_applied)
+        dispatch = AsyncMock()
+        monkeypatch.setattr(job_manager._matching, "try_discdb_assignment", discdb)
+        monkeypatch.setattr(job_manager._matching, "match_single_file", dispatch)
+        monkeypatch.setattr(job_manager._matching, "on_match_task_done", lambda *a, **k: None)
+        return discdb, dispatch
+
+    async def _add_title(self, job_id, index, state, output=None):
+        async with _unit_session_factory() as session:
+            t = DiscTitle(
+                job_id=job_id,
+                title_index=index,
+                duration_seconds=1380,
+                state=state,
+                output_filename=output,
+            )
+            session.add(t)
+            await session.commit()
+            await session.refresh(t)
+            return t
+
+    async def test_dispatches_only_queued_titles_with_existing_files(self, tmp_path, monkeypatch):
+        job, ripping = await _seed(content_type=ContentType.TV, identity_prompt_json=_PROMPT)
+        f = tmp_path / "show_t01.mkv"
+        f.write_text("")
+        queued_ok = await self._add_title(job.id, 1, TitleState.QUEUED, output=str(f))
+        await self._add_title(job.id, 2, TitleState.QUEUED, output=str(tmp_path / "missing.mkv"))
+        await self._add_title(job.id, 3, TitleState.QUEUED, output=None)
+        g = tmp_path / "show_t04.mkv"
+        g.write_text("")
+        await self._add_title(job.id, 4, TitleState.MATCHED, output=str(g))
+        _discdb, dispatch = self._stub_dispatch(monkeypatch)
+
+        count = await job_manager.dispatch_pending_matches(job.id)
+        await asyncio.sleep(0)
+
+        assert count == 1
+        dispatch.assert_awaited_once_with(job.id, queued_ok.id, f)
+        # The RIPPING seed title is untouched.
+        assert (await _get_title(ripping.id)).state == TitleState.RIPPING
+
+    async def test_discdb_assignment_path_checks_completion(self, tmp_path, monkeypatch):
+        job, _ = await _seed(content_type=ContentType.TV)
+        f = tmp_path / "show_t01.mkv"
+        f.write_text("")
+        await self._add_title(job.id, 1, TitleState.QUEUED, output=str(f))
+        _discdb, dispatch = self._stub_dispatch(monkeypatch, discdb_applied=True)
+        completion = AsyncMock()
+        monkeypatch.setattr(job_manager._finalization, "check_job_completion", completion)
+
+        count = await job_manager.dispatch_pending_matches(job.id)
+
+        assert count == 1
+        completion.assert_awaited_once()
+        dispatch.assert_not_called()
+
+    async def test_double_dispatch_does_not_double_match(self, tmp_path, monkeypatch):
+        """The in-flight guard makes repeat dispatch safe: the QUEUED→MATCHING
+        flip happens only post-semaphore in match_single_file, so a title whose
+        task is still parked waiting for a slot is still QUEUED — state alone
+        cannot prevent a double spawn."""
+        job, _ = await _seed(content_type=ContentType.TV, identity_prompt_json=_PROMPT)
+        f = tmp_path / "show_t01.mkv"
+        f.write_text("")
+        title = await self._add_title(job.id, 1, TitleState.QUEUED, output=str(f))
+
+        monkeypatch.setattr(
+            job_manager._matching, "try_discdb_assignment", AsyncMock(return_value=False)
+        )
+        release = asyncio.Event()
+        calls = []
+
+        async def slow_match(jid, tid, path):
+            calls.append((jid, tid))
+            await release.wait()  # park like a saturated match semaphore
+
+        monkeypatch.setattr(job_manager._matching, "match_single_file", slow_match)
+        monkeypatch.setattr(job_manager._matching, "on_match_task_done", lambda *a, **k: None)
+
+        first = await job_manager.dispatch_pending_matches(job.id)
+        await asyncio.sleep(0)  # let the match task start and park on the event
+        # Title is still QUEUED (flip is post-semaphore) — a second dispatch
+        # must not spawn a second match for it.
+        assert (await _get_title(title.id)).state == TitleState.QUEUED
+        second = await job_manager.dispatch_pending_matches(job.id)
+        await asyncio.sleep(0)
+
+        assert first == 1
+        assert second == 0
+        assert calls == [(job.id, title.id)]
+
+        # Let the task finish; the done callback releases the guard so a later
+        # legitimate re-dispatch isn't blocked forever.
+        release.set()
+        await asyncio.sleep(0.05)
+        assert title.id not in job_manager._inflight_match_dispatch
+
+    async def test_no_queued_titles_is_noop(self, tmp_path, monkeypatch):
+        job, _ = await _seed(content_type=ContentType.TV)
+        _discdb, dispatch = self._stub_dispatch(monkeypatch)
+
+        assert await job_manager.dispatch_pending_matches(job.id) == 0
+        dispatch.assert_not_called()
+
+    async def test_non_tv_job_is_skipped(self, tmp_path, monkeypatch):
+        """Defensive guard: a misrouted caller passing a MOVIE job must not
+        episode-match its titles, even with QUEUED titles whose files exist."""
+        job, _ = await _seed(content_type=ContentType.MOVIE)
+        f = tmp_path / "movie_t01.mkv"
+        f.write_text("")
+        await self._add_title(job.id, 1, TitleState.QUEUED, output=str(f))
+        _discdb, dispatch = self._stub_dispatch(monkeypatch)
+
+        assert await job_manager.dispatch_pending_matches(job.id) == 0
+        dispatch.assert_not_called()
 
 
 @pytest.mark.unit
@@ -347,6 +566,283 @@ class TestRunRippingSessionScoping:
             refreshed = await session.get(DiscJob, job.id)
         assert refreshed.state == JobState.FAILED
         assert refreshed.error_message == "Cancelled by user"
+
+
+_SEASON_PROMPT = json.dumps(
+    {"kind": "season", "reason": "Couldn't determine the season. Please select a season."}
+)
+
+
+@pytest.mark.unit
+class TestBlockingIdentityPrompt:
+    """Walk-away B4: kind-aware identity-prompt predicate. kind=season never
+    blocks (identity known, cross-season matching proceeds); name/reidentify
+    block; malformed JSON / unrecognized kinds fail closed (blocking)."""
+
+    def _job(self, prompt):
+        return DiscJob(drive_id="E:", volume_label="X", identity_prompt_json=prompt)
+
+    def test_no_prompt_is_not_blocking(self):
+        assert job_manager._blocking_identity_prompt(None) is None
+        assert job_manager._blocking_identity_prompt(self._job(None)) is None
+
+    @pytest.mark.parametrize("kind", ["name", "reidentify"])
+    def test_name_and_reidentify_block(self, kind):
+        prompt = job_manager._blocking_identity_prompt(
+            self._job(json.dumps({"kind": kind, "reason": "why"}))
+        )
+        assert prompt == {"kind": kind, "reason": "why"}
+
+    def test_season_kind_does_not_block(self):
+        job = self._job(json.dumps({"kind": "season", "reason": "pick a season"}))
+        assert job_manager._blocking_identity_prompt(job) is None
+
+    @pytest.mark.parametrize("raw", ["{not json", "[1, 2]", '"just a string"'])
+    def test_malformed_prompt_blocks_with_fallback_reason(self, raw, caplog):
+        with caplog.at_level(logging.WARNING, logger="app.services.job_manager"):
+            prompt = job_manager._blocking_identity_prompt(self._job(raw))
+        assert prompt is not None
+        assert prompt["reason"] == jm_mod._FALLBACK_IDENTITY_REVIEW_REASON
+        assert any("malformed identity_prompt_json" in r.message for r in caplog.records)
+
+    def test_unrecognized_kind_blocks(self):
+        prompt = job_manager._blocking_identity_prompt(
+            self._job(json.dumps({"kind": "mystery", "reason": "??"}))
+        )
+        assert prompt == {"kind": "mystery", "reason": "??"}
+
+
+@pytest.mark.unit
+class TestRunRippingIdentityConvergence:
+    """Walk-away B4: post-rip convergence for identity-pending jobs.
+
+    A BLOCKING identity prompt (kind=name/reidentify) that survives to rip end
+    converts into pooled review: RIPPING→REVIEW_NEEDED, review_reason carries
+    the prompt's reason verbatim (frontend literal contracts), the prompt is
+    cleared, and the WS broadcast clears it with "" (enumerated-WS clear
+    pattern). kind=season never blocks: the job takes today's path with the
+    prompt left in place."""
+
+    def _spy_broadcast(self, monkeypatch):
+        calls = []
+
+        async def spy(job_id, state, **kwargs):
+            calls.append((job_id, state, kwargs))
+
+        monkeypatch.setattr(ws_manager, "broadcast_job_update", spy)
+        return calls
+
+    async def test_blocking_prompt_converges_to_review(self, rip_env, monkeypatch):
+        job, _title = await _seed(
+            content_type=ContentType.TV,
+            staging=str(rip_env),
+            is_selected=True,
+            identity_prompt_json=_PROMPT,
+        )
+        monkeypatch.setattr(job_manager, "_backfill_unmatched_titles", AsyncMock())
+        calls = self._spy_broadcast(monkeypatch)
+        kicked = []
+        monkeypatch.setattr(job_manager._prewarmer, "kickoff", lambda jid: kicked.append(jid))
+        _mock_rip(monkeypatch, RipResult(success=True, output_files=[]))
+
+        await job_manager._run_ripping(job.id)
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.REVIEW_NEEDED
+        assert refreshed.review_reason == "Disc label unreadable"
+        assert refreshed.identity_prompt_json is None
+
+        review_calls = [c for c in calls if c[1] == JobState.REVIEW_NEEDED.value]
+        assert len(review_calls) == 1
+        _jid, _state, kwargs = review_calls[0]
+        assert kwargs["review_reason"] == "Disc label unreadable"
+        assert kwargs["identity_prompt_json"] == ""
+        # Phase A prewarmer fires for free via the on_transition observer.
+        assert kicked == [job.id]
+
+    async def test_season_prompt_does_not_block_convergence(self, rip_env, monkeypatch):
+        job, _title = await _seed(
+            content_type=ContentType.TV,
+            staging=str(rip_env),
+            is_selected=True,
+            identity_prompt_json=_SEASON_PROMPT,
+        )
+        monkeypatch.setattr(job_manager, "_backfill_unmatched_titles", AsyncMock())
+        _mock_rip(monkeypatch, RipResult(success=True, output_files=[]))
+
+        await job_manager._run_ripping(job.id)
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.MATCHING  # today's TV path
+        assert refreshed.identity_prompt_json == _SEASON_PROMPT  # untouched
+        assert refreshed.review_reason is None
+
+    async def test_unknown_content_type_with_blocking_prompt_converges(self, rip_env, monkeypatch):
+        job, _title = await _seed(
+            content_type=ContentType.UNKNOWN,
+            staging=str(rip_env),
+            is_selected=True,
+            identity_prompt_json=json.dumps({"kind": "reidentify", "reason": "Ambiguous match"}),
+        )
+        monkeypatch.setattr(job_manager, "_backfill_unmatched_titles", AsyncMock())
+        _mock_rip(monkeypatch, RipResult(success=True, output_files=[]))
+
+        await job_manager._run_ripping(job.id)
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.REVIEW_NEEDED
+        assert refreshed.review_reason == "Ambiguous match"
+        assert refreshed.identity_prompt_json is None
+
+    async def test_malformed_prompt_is_blocking(self, rip_env, monkeypatch, caplog):
+        job, _title = await _seed(
+            content_type=ContentType.TV,
+            staging=str(rip_env),
+            is_selected=True,
+            identity_prompt_json="{not json",
+        )
+        monkeypatch.setattr(job_manager, "_backfill_unmatched_titles", AsyncMock())
+        _mock_rip(monkeypatch, RipResult(success=True, output_files=[]))
+
+        with caplog.at_level(logging.WARNING, logger="app.services.job_manager"):
+            await job_manager._run_ripping(job.id)
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.REVIEW_NEEDED
+        assert refreshed.review_reason == jm_mod._FALLBACK_IDENTITY_REVIEW_REASON
+        assert refreshed.identity_prompt_json is None
+        assert any("malformed identity_prompt_json" in r.message for r in caplog.records)
+
+    async def test_content_type_reread_after_rip(self, rip_env, monkeypatch):
+        """The post-rip fork follows the DB row, not the setup-time local: a
+        mid-rip mutation (B5 answer) flipping TV→MOVIE must land the job on the
+        movie path (with the fresh detected_title), not RIPPING→MATCHING."""
+        job, _title = await _seed(
+            content_type=ContentType.TV, staging=str(rip_env), is_selected=True
+        )
+        out_file = rip_env / "movie.mkv"
+        organize_calls = []
+
+        def fake_organize(output_dir, volume_label, detected_title):
+            organize_calls.append(detected_title)
+            return {"success": True, "main_file": out_file}
+
+        monkeypatch.setattr(jm_mod.movie_organizer, "organize", fake_organize)
+
+        async def _rip(*args, **kwargs):
+            # Mutate the row mid-"rip", as a future answer endpoint would.
+            async with _unit_session_factory() as s:
+                j = await s.get(DiscJob, job.id)
+                j.content_type = ContentType.MOVIE
+                j.detected_title = "Fresh Title"
+                await s.commit()
+            return RipResult(success=True, output_files=[out_file])
+
+        monkeypatch.setattr(job_manager._extractor, "rip_titles", AsyncMock(side_effect=_rip))
+
+        await job_manager._run_ripping(job.id)
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.COMPLETED  # movie path, not MATCHING
+        assert refreshed.final_path == str(out_file)
+        assert organize_calls == ["Fresh Title"]  # fresh detected_title, not the stale local
+
+    async def test_converge_skips_job_already_out_of_ripping(self, rip_env):
+        """All-titles-stalled rips park in REVIEW_NEEDED before convergence runs;
+        the convergence must not stomp that review_reason and leaves the prompt
+        in place (the review flow / answer endpoints own it)."""
+        job, _title = await _seed(
+            content_type=ContentType.TV, staging=str(rip_env), identity_prompt_json=_PROMPT
+        )
+        async with _unit_session_factory() as s:
+            j = await s.get(DiscJob, job.id)
+            j.state = JobState.REVIEW_NEEDED
+            j.review_reason = "stall reason"
+            await s.commit()
+
+        await job_manager._converge_identity_pending_job(
+            job.id, {"kind": "name", "reason": "Disc label unreadable"}
+        )
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.REVIEW_NEEDED
+        assert refreshed.review_reason == "stall reason"  # not overwritten
+        assert refreshed.identity_prompt_json == _PROMPT  # left in place
+
+    async def test_converge_missing_reason_uses_fallback(self, rip_env):
+        job, _title = await _seed(
+            content_type=ContentType.TV,
+            staging=str(rip_env),
+            identity_prompt_json=json.dumps({"kind": "name"}),
+        )
+
+        assert await job_manager._converge_identity_pending_job(job.id, {"kind": "name"}) is True
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.REVIEW_NEEDED
+        assert refreshed.review_reason == jm_mod._FALLBACK_IDENTITY_REVIEW_REASON
+        assert refreshed.identity_prompt_json is None
+
+    async def test_converge_skips_park_when_prompt_answered_mid_window(self, rip_env):
+        """B5 race tolerance (the B4 TOCTOU note): an answer landing between
+        the rip-end prompt read and convergence clears the prompt on the row —
+        convergence must re-check the fresh row and NOT park the answered job
+        behind a stale question."""
+        job, _title = await _seed(
+            content_type=ContentType.TV,
+            staging=str(rip_env),
+            identity_prompt_json=None,  # the answer already cleared it
+        )
+
+        converged = await job_manager._converge_identity_pending_job(
+            job.id, {"kind": "name", "reason": "Disc label unreadable"}
+        )
+
+        assert converged is False  # caller falls through to the normal flow
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.RIPPING  # untouched
+        assert refreshed.review_reason is None
+
+    async def test_run_ripping_falls_through_when_answered_during_convergence(
+        self, rip_env, monkeypatch
+    ):
+        """End-to-end race: the answer lands during the backfill/reconcile
+        window. The job must continue down the normal TV post-rip path
+        (RIPPING→MATCHING) instead of parking in review with a stale reason."""
+        job, _title = await _seed(
+            content_type=ContentType.TV,
+            staging=str(rip_env),
+            is_selected=True,
+            identity_prompt_json=_PROMPT,
+        )
+
+        async def answer_during_backfill(*args, **kwargs):
+            # Simulate the B5 answer endpoint committing mid-window.
+            async with _unit_session_factory() as s:
+                j = await s.get(DiscJob, job.id)
+                j.identity_prompt_json = None
+                j.detected_title = "Answered Show"
+                await s.commit()
+
+        monkeypatch.setattr(
+            job_manager, "_backfill_unmatched_titles", AsyncMock(side_effect=answer_during_backfill)
+        )
+        _mock_rip(monkeypatch, RipResult(success=True, output_files=[]))
+
+        await job_manager._run_ripping(job.id)
+
+        async with _unit_session_factory() as session:
+            refreshed = await session.get(DiscJob, job.id)
+        assert refreshed.state == JobState.MATCHING  # normal TV path, not REVIEW_NEEDED
+        assert refreshed.review_reason is None
 
 
 async def _seed_two_selected(staging):
@@ -598,3 +1094,128 @@ class TestCreateJobForDiscDedup:
         await self._insert("DISC_B")
 
         assert len(await self._jobs_for_drive()) == 0
+
+
+@pytest.mark.unit
+class TestDispatchTitleMatchTOCTOU:
+    """Fix 1 (B3 review): the in-flight sentinel is claimed BEFORE any await, so
+    two concurrent ``_dispatch_title_match`` calls for the same title cannot both
+    slip through the membership check and spawn duplicate match tasks (TOCTOU).
+
+    The discdb-applied early-return path must also discard the sentinel so a
+    future legitimate dispatch is not permanently blocked."""
+
+    def _stub_matching(self, monkeypatch, discdb_applied=False):
+        discdb = AsyncMock(return_value=discdb_applied)
+        release = asyncio.Event()
+        calls = []
+
+        async def slow_match(jid, tid, path):
+            calls.append((jid, tid))
+            await release.wait()
+
+        monkeypatch.setattr(job_manager._matching, "try_discdb_assignment", discdb)
+        monkeypatch.setattr(job_manager._matching, "match_single_file", slow_match)
+        monkeypatch.setattr(job_manager._matching, "on_match_task_done", lambda *a, **k: None)
+        return discdb, calls, release
+
+    async def test_concurrent_calls_spawn_exactly_one_task(self, tmp_path, monkeypatch):
+        """Two concurrent _dispatch_title_match for the same title must not
+        double-spawn: the sentinel is claimed before any await so both coroutines
+        can't both pass the membership check."""
+        job, title = await _seed(content_type=ContentType.TV)
+        _discdb, calls, release = self._stub_matching(monkeypatch)
+
+        f = tmp_path / "show_t00.mkv"
+        f.write_text("")
+
+        # Fire both dispatches concurrently — no await between them on the
+        # caller side, so both enter _dispatch_title_match before either
+        # has a chance to add to the set.  The fixed code claims the slot
+        # synchronously before the first await, making this race impossible.
+        first, second = await asyncio.gather(
+            job_manager._dispatch_title_match(job.id, title.id, f),
+            job_manager._dispatch_title_match(job.id, title.id, f),
+        )
+        await asyncio.sleep(0)
+
+        # Exactly one dispatch returns True, the other False.
+        assert sorted([first, second]) == [False, True]
+        assert calls == [(job.id, title.id)]
+
+        # Let the task finish; sentinel released so future dispatches work.
+        release.set()
+        await asyncio.sleep(0.05)
+        assert title.id not in job_manager._inflight_match_dispatch
+
+    async def test_discdb_applied_path_releases_sentinel(self, tmp_path, monkeypatch):
+        """When DiscDB assignment resolves the title (no match task spawned),
+        the sentinel must be discarded so a subsequent dispatch is not blocked."""
+        job, title = await _seed(content_type=ContentType.TV)
+        self._stub_matching(monkeypatch, discdb_applied=True)
+        completion = AsyncMock()
+        monkeypatch.setattr(job_manager._finalization, "check_job_completion", completion)
+
+        f = tmp_path / "show_t00.mkv"
+        f.write_text("")
+
+        result = await job_manager._dispatch_title_match(job.id, title.id, f)
+        assert result is True
+        # Sentinel must be released — no match task was spawned.
+        assert title.id not in job_manager._inflight_match_dispatch
+
+        # A follow-up dispatch (e.g. after a re-rip) must not be blocked.
+        result2 = await job_manager._dispatch_title_match(job.id, title.id, f)
+        assert result2 is True
+
+
+@pytest.mark.unit
+class TestTransitionTitleOutOfRippingGate:
+    """Fix 2 (B3 review): ``_transition_title_out_of_ripping`` applies the same
+    identity gate as ``_on_title_ripped``.  A pending identity prompt must park
+    every content-type in QUEUED, not MATCHED, so titles stay visible to
+    ``dispatch_pending_matches`` and don't leak through unmatched."""
+
+    async def test_tv_without_prompt_parks_queued(self, monkeypatch):
+        job, title = await _seed(content_type=ContentType.TV)
+        await job_manager._transition_title_out_of_ripping(
+            job.id, title.id, ContentType.TV, expected_size=1024, actual_size=1024
+        )
+        t = await _get_title(title.id)
+        assert t.state == TitleState.QUEUED
+
+    async def test_movie_without_prompt_becomes_matched(self, monkeypatch):
+        job, title = await _seed(content_type=ContentType.MOVIE)
+        await job_manager._transition_title_out_of_ripping(
+            job.id, title.id, ContentType.MOVIE, expected_size=1024, actual_size=1024
+        )
+        t = await _get_title(title.id)
+        assert t.state == TitleState.MATCHED
+
+    @pytest.mark.parametrize("content_type", [ContentType.UNKNOWN, ContentType.MOVIE])
+    async def test_non_tv_with_prompt_parks_queued_not_matched(self, monkeypatch, content_type):
+        """An identity-pending job must NOT leak to MATCHED via the fs-monitor
+        path, just as it cannot via _on_title_ripped."""
+        job, title = await _seed(content_type=content_type, identity_prompt_json=_PROMPT)
+        await job_manager._transition_title_out_of_ripping(
+            job.id, title.id, content_type, expected_size=1024, actual_size=1024
+        )
+        t = await _get_title(title.id)
+        assert t.state == TitleState.QUEUED
+
+    async def test_tv_with_prompt_parks_queued(self, monkeypatch):
+        job, title = await _seed(content_type=ContentType.TV, identity_prompt_json=_PROMPT)
+        await job_manager._transition_title_out_of_ripping(
+            job.id, title.id, ContentType.TV, expected_size=1024, actual_size=1024
+        )
+        t = await _get_title(title.id)
+        assert t.state == TitleState.QUEUED
+
+    async def test_non_ripping_title_is_untouched(self, monkeypatch):
+        """Guard: only RIPPING titles are transitioned."""
+        job, title = await _seed(content_type=ContentType.TV, state=TitleState.QUEUED)
+        await job_manager._transition_title_out_of_ripping(
+            job.id, title.id, ContentType.TV, expected_size=1024, actual_size=1024
+        )
+        t = await _get_title(title.id)
+        assert t.state == TitleState.QUEUED  # unchanged (was QUEUED, not RIPPING)
