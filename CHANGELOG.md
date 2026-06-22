@@ -4,6 +4,10 @@ All notable changes to Engram will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Reassign a track on a completed job from the History detail panel.** Open any completed job in History and reassign a misfiled track to a different episode, mark it as an extra, or discard it. Engram moves the organized library file to its new home (extras and discards both land in the show's `Extras/` folder) and, when the track's audio fingerprint was already contributed to the shared network, retracts that erroneous fingerprint and re-submits the corrected one as a user-verified match. The fingerprint network heals by re-deriving the episode's consensus from the remaining contributions. Previously a completed job's assignments were locked, so a single mismatched track could block a later disc with a duplicate-file conflict, and there was no way to correct a contributed fingerprint after the fact.
+
 ## [0.21.8] - 2026-06-21
 
 _Highlights: Engram now ships a native ARM64 build for NVIDIA Jetson and other aarch64 Linux devices, with the auto-updater delivering the correct binary per architecture._
