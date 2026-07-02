@@ -1085,7 +1085,9 @@ class JobManager:
             async with async_session() as session:
                 job = await session.get(DiscJob, job_id)
             label = (
-                (job.detected_title or job.volume_label or f"Job #{job_id}") if job else f"Job #{job_id}"
+                (job.detected_title or job.volume_label or f"Job #{job_id}")
+                if job
+                else f"Job #{job_id}"
             )
             await notify_discord(config.discord_webhook_url, job_id, label, state.value)
         except Exception as e:

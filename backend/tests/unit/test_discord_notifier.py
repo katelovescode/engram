@@ -229,7 +229,9 @@ async def test_terminal_callback_schedules_task():
     from app.models import JobState
     from app.services.job_manager import job_manager
 
-    with patch.object(job_manager, "_send_discord_notification", new_callable=AsyncMock) as mock_send:
+    with patch.object(
+        job_manager, "_send_discord_notification", new_callable=AsyncMock
+    ) as mock_send:
         await job_manager._notify_discord_on_terminal(1, JobState.COMPLETED)
         await asyncio.sleep(0)  # yield to let the task start
 
@@ -259,7 +261,9 @@ async def test_advance_job_via_state_machine_fires_notification():
         await session.refresh(job)
         job_id = job.id
 
-    with patch.object(job_manager, "_send_discord_notification", new_callable=AsyncMock) as mock_send:
+    with patch.object(
+        job_manager, "_send_discord_notification", new_callable=AsyncMock
+    ) as mock_send:
         new_state = await job_manager.advance_job_via_state_machine(job_id)
         await asyncio.sleep(0)
 
