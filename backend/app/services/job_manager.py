@@ -1065,7 +1065,15 @@ class JobManager:
             logger.warning(f"Job {job_id}: disc contribution enqueue failed: {e}", exc_info=True)
 
     async def _notify_discord_on_terminal(self, job_id: int, state: JobState) -> None:
-        """on_terminal_state hook: post a Discord notification on COMPLETED or FAILED."""
+        """on_terminal_state hook: schedule a Discord notification and return immediately.
+
+        Fire-and-forget via create_task so a slow or unreachable webhook never
+        delays job finalization — the 10s httpx timeout stays off the critical path.
+        """
+        asyncio.create_task(self._send_discord_notification(job_id, state))
+
+    async def _send_discord_notification(self, job_id: int, state: JobState) -> None:
+        """Send the Discord embed. Runs as a background task; all errors are swallowed."""
         try:
             from app.core.discord_notifier import notify_discord
             from app.services.config_service import get_config

@@ -1,5 +1,6 @@
 """Tests for Discord webhook notifications."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -94,27 +95,27 @@ async def test_notify_discord_swallows_http_errors():
 
 
 # --------------------------------------------------------------------------- #
-# _notify_discord_on_terminal integration with job_manager
+# _send_discord_notification — notification logic tests
+# (call the worker directly; _notify_discord_on_terminal only schedules the task)
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_terminal_callback_noop_when_no_webhook():
+async def test_send_notification_noop_when_no_webhook():
     """No webhook URL configured → notify_discord never called."""
+    from app.models import JobState
     from app.services.config_service import update_config
     from app.services.job_manager import job_manager
 
     await update_config(discord_webhook_url="")
 
     with patch("app.core.discord_notifier.notify_discord") as mock_notify:
-        from app.models import JobState
-
-        await job_manager._notify_discord_on_terminal(99, JobState.COMPLETED)
+        await job_manager._send_discord_notification(99, JobState.COMPLETED)
         mock_notify.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_terminal_callback_fires_on_completed():
+async def test_send_notification_fires_on_completed():
     """COMPLETED with webhook URL → notify_discord called with job label."""
     from app.database import async_session
     from app.models import JobState
@@ -136,7 +137,7 @@ async def test_terminal_callback_fires_on_completed():
         job_id = job.id
 
     with patch("app.core.discord_notifier.notify_discord", new_callable=AsyncMock) as mock_notify:
-        await job_manager._notify_discord_on_terminal(job_id, JobState.COMPLETED)
+        await job_manager._send_discord_notification(job_id, JobState.COMPLETED)
 
     mock_notify.assert_called_once()
     _, label, state = (
@@ -149,7 +150,7 @@ async def test_terminal_callback_fires_on_completed():
 
 
 @pytest.mark.asyncio
-async def test_terminal_callback_fires_on_failed():
+async def test_send_notification_fires_on_failed():
     """FAILED with webhook URL → notify_discord called with 'failed' state."""
     from app.database import async_session
     from app.models import JobState
@@ -170,7 +171,7 @@ async def test_terminal_callback_fires_on_failed():
         job_id = job.id
 
     with patch("app.core.discord_notifier.notify_discord", new_callable=AsyncMock) as mock_notify:
-        await job_manager._notify_discord_on_terminal(job_id, JobState.FAILED)
+        await job_manager._send_discord_notification(job_id, JobState.FAILED)
 
     mock_notify.assert_called_once()
     state = mock_notify.call_args[0][3]
@@ -178,7 +179,7 @@ async def test_terminal_callback_fires_on_failed():
 
 
 @pytest.mark.asyncio
-async def test_terminal_callback_falls_back_to_volume_label():
+async def test_send_notification_falls_back_to_volume_label():
     """When detected_title is empty, volume_label is used as the notification label."""
     from app.database import async_session
     from app.models import JobState
@@ -200,15 +201,45 @@ async def test_terminal_callback_falls_back_to_volume_label():
         job_id = job.id
 
     with patch("app.core.discord_notifier.notify_discord", new_callable=AsyncMock) as mock_notify:
-        await job_manager._notify_discord_on_terminal(job_id, JobState.COMPLETED)
+        await job_manager._send_discord_notification(job_id, JobState.COMPLETED)
 
     label = mock_notify.call_args[0][2]
     assert label == "UNKNOWN_DISC"
 
 
 @pytest.mark.asyncio
+async def test_send_notification_swallows_internal_errors():
+    """Errors inside the worker never propagate (best-effort)."""
+    from app.models import JobState
+    from app.services.config_service import update_config
+    from app.services.job_manager import job_manager
+
+    await update_config(discord_webhook_url="https://discord.com/api/webhooks/1/tok")
+
+    with patch(
+        "app.core.discord_notifier.notify_discord",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("network dead"),
+    ):
+        await job_manager._send_discord_notification(999, JobState.COMPLETED)
+
+
+@pytest.mark.asyncio
+async def test_terminal_callback_schedules_task():
+    """_notify_discord_on_terminal fires _send_discord_notification as a background task."""
+    from app.models import JobState
+    from app.services.job_manager import job_manager
+
+    with patch.object(job_manager, "_send_discord_notification", new_callable=AsyncMock) as mock_send:
+        await job_manager._notify_discord_on_terminal(1, JobState.COMPLETED)
+        await asyncio.sleep(0)  # yield to let the task start
+
+    mock_send.assert_called_once_with(1, JobState.COMPLETED)
+
+
+@pytest.mark.asyncio
 async def test_advance_job_via_state_machine_fires_notification():
-    """advance_job_via_state_machine ORGANIZING→COMPLETED fires the Discord callback."""
+    """advance_job_via_state_machine ORGANIZING→COMPLETED schedules Discord notification."""
     from app.database import async_session
     from app.models import JobState
     from app.services.config_service import update_config
@@ -229,27 +260,10 @@ async def test_advance_job_via_state_machine_fires_notification():
         await session.refresh(job)
         job_id = job.id
 
-    with patch("app.core.discord_notifier.notify_discord", new_callable=AsyncMock) as mock_notify:
+    with patch.object(job_manager, "_send_discord_notification", new_callable=AsyncMock) as mock_send:
         new_state = await job_manager.advance_job_via_state_machine(job_id)
+        await asyncio.sleep(0)
 
     assert new_state == "completed"
-    mock_notify.assert_called_once()
-    assert mock_notify.call_args[0][3] == "completed"
-
-
-@pytest.mark.asyncio
-async def test_terminal_callback_swallows_internal_errors():
-    """Errors inside the callback never propagate (best-effort)."""
-    from app.models import JobState
-    from app.services.config_service import update_config
-    from app.services.job_manager import job_manager
-
-    await update_config(discord_webhook_url="https://discord.com/api/webhooks/1/tok")
-
-    with patch(
-        "app.core.discord_notifier.notify_discord",
-        new_callable=AsyncMock,
-        side_effect=RuntimeError("network dead"),
-    ):
-        # Should not raise
-        await job_manager._notify_discord_on_terminal(999, JobState.COMPLETED)
+    mock_send.assert_called_once()
+    assert mock_send.call_args[0][1] == JobState.COMPLETED

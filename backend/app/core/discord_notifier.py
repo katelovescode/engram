@@ -9,7 +9,7 @@ async def notify_discord(webhook_url: str, job_id: int, label: str, state: str) 
     if not webhook_url:
         return
 
-    color = 0x00B97A if state == "completed" else 0xE53935  # teal / red
+    color = 0x00B97A if state == "completed" else 0xE53935  # green / red
     emoji = "✅" if state == "completed" else "❌"
 
     payload = {
